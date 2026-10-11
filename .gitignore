@@ -1,0 +1,72 @@
+# ============================================================================
+# NADA de lo que aparece aqui debe subirse: deriva del juego (Activision) o es
+# producto de compilacion / descarga. Se regenera con setup.ps1 desde la ISO del usuario.
+# ============================================================================
+
+# --- Contenido del juego y derivados directos ---
+*.iso
+*.xex
+*.xexp
+*.xzp
+*.pak
+*.bk2
+*.bik
+*.lex
+iso_extract/
+game/
+analysis/image.bin
+analysis/*.bin
+
+# --- Codigo recompilado y configuracion derivada del binario del juego ---
+ppc/
+runtime/ppc_gen/
+runtime/ppc_sources.cmake
+runtime/src/kernel/import_stubs.gen.cpp
+analysis/SwapForce.toml
+analysis/SwapForce_switch_tables.toml
+analysis/recomp_*.txt
+analysis/syntax_check*
+runtime/recomp/SwapForce.toml
+runtime/recomp/SwapForce_switch_tables.toml
+runtime/recomp/SwapForce_switch_tables.toml.pre_extra
+runtime/recomp/extra_switch_tables.toml
+runtime/recomp/recomp_*.txt
+runtime/recomp/*.bak*
+setup_hashes.txt
+
+# --- Datos de ejecucion generados por el juego (shaders, fotogramas, cache, guardados) ---
+runtime/userdata/
+runtime/*.log
+runtime/build_*.log
+*.log
+gpu.log
+runtime.log
+*.png
+*.dds
+*.dxil
+*.hlsl
+xenos_*.bin
+ucode_*.bin
+
+# --- Compilacion ---
+runtime/build/
+/build/
+/out/
+*.obj
+*.pdb
+*.map
+*.exe
+*.dll
+*.lib
+*.ilk
+*.exp
+
+# --- Herramientas descargadas por setup.ps1 (no redistribuir) ---
+/tools/
+/runtime/ref/
+
+# --- Copias auxiliares de edicion ---
+*.orig
+*.pre_*
+*.rej
+_e2e_test/

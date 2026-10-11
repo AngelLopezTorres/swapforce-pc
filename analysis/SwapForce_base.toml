@@ -1,0 +1,8 @@
+[main]
+file_path = "../iso_extract/default.xex"
+out_directory_path = "../ppc"
+switch_table_file_path = "SwapForce_switch_tables.toml"
+
+# register save/restore helpers located by pattern search in the decrypted image (analysis/dump_image.py)
+restgprlr_14_address = 0x82FF2D50
+savegprlr_14_address = 0x82FF2D00
