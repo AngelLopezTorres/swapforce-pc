@@ -14,7 +14,7 @@ Formal, escueto, metódico; solo datos objetivos y documentables, sin opiniones;
 
 ## Estado medido (última verificación completa)
 - Runtime: el juego arranca `_xstart`, ejecuta millones de imports y entra en su bucle principal. GPU: PM4 sin opcodes desconocidos, 55 shaders traducidos a DXIL (55/55), ventana D3D12, volcado de frames a PNG, resolve y texturas básicas.
-- NO hay imagen visible: todos los frames salen negros. Causa en investigación: la composición final usa planos Y/U/V de vídeo Bink 1 (`gsbp_atvi.bik`) que no avanza.
+- Imagen (2026-10-22): los vídeos Bink 1 (`gsbp_atvi.bik`, logotipo Activision) y Bink 2 (`gsbp_vvisions.bk2`) se decodifican y se ven en los volcados PNG tras actualizar `KeTimeStampBundle.tick_count` cada 1 ms (antes constante: BinkWait nunca avanzaba). Siguiente bloqueo: `XMACreateContext` (stub) -> escritura en dirección guest 0 y el juego se detiene (M4). Detalle en `PROGRESS.md`, apartado «Bink».
 - Audio mínimo (M2): 187,49 callbacks/s (sumidero nulo, no suena). Con audio activo el flujo cambia: un hilo muere con `__builtin_debugtrap` en `vupkd3d128 ...,20` (FLOAT16_4) en `sub_826D2AB8` y el hilo principal queda bloqueado en una sección crítica de ese hilo.
 - Rendimiento ~7-9 fps. Simplificaciones registradas como `SIMPLIFY` (MSAA 1X, sin EDRAM, sin resolve de profundidad, sin mips).
 
