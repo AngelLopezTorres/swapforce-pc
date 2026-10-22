@@ -1,3 +1,5 @@
+#include "fast_hash.h"
+#include "perf.h"
 // H3: draws. Estado de D3D12 derivado de los registros del Xenos (port reducido de pipeline_cache.cc y draw_util.cc de Xenia,
 // copias en runtime\ref\). Simplificaciones registradas con Note("SIMPLIFY ...").
 #include <algorithm>
@@ -159,9 +161,16 @@ ID3D12PipelineState* D3D12Backend::GetPso(const ShaderInfo& vsI, const ShaderInf
     auto sr = R<reg::RB_STENCILREFMASK>();
     st.stencilRead = sr.stencilmask; st.stencilWrite = sr.stencilwritemask;
     st.modeCntl = R<reg::PA_SU_SC_MODE_CNTL>().value & 0x7; st.clipDisable = R<reg::PA_CL_CLIP_CNTL>().clip_disable;
+    uint64_t hkey = FastHash(&st, sizeof(st));
+    {
+        auto range = psoFast.equal_range(hkey);
+        for (auto r = range.first; r != range.second; ++r)
+            if (r->second.first.size() == sizeof(st) && !std::memcmp(r->second.first.data(), &st, sizeof(st))) return r->second.second;
+    }
     std::string key((const char*)&st, sizeof(st));
     auto it = psoCache.find(key);
-    if (it != psoCache.end()) return it->second.Get();
+    if (it != psoCache.end()) { psoFast.emplace(hkey, std::make_pair(key, it->second.Get())); return it->second.Get(); }
+    PERF_ZONE(kZonePsoCreate);
 
     const DxilBlob* vsB = GetDxil(vsI, -1);
     const DxilBlob* psB = psI ? GetDxil(*psI, pg) : nullptr;
@@ -392,10 +401,12 @@ bool D3D12Backend::DoDraw(const DrawEvent& ev, const ShaderInfo* vs, const Shade
     UploadAlloc cb = Upload(sizeof(XeConsts), 256);
     if (!cb.cpu) { Note("OMISION draw: constantes demasiado grandes"); return false; }
     XeConsts* c = reinterpret_cast<XeConsts*>(cb.cpu);
-    for (uint32_t i = 0; i < 1024; ++i) { reinterpret_cast<uint32_t*>(c->vsFloat)[i] = RV(0x4000 + i); reinterpret_cast<uint32_t*>(c->psFloat)[i] = RV(0x4400 + i); }
-    for (uint32_t i = 0; i < 192; ++i) reinterpret_cast<uint32_t*>(c->fetch)[i] = RV(0x4800 + i);
-    for (uint32_t i = 0; i < 8; ++i) reinterpret_cast<uint32_t*>(c->boolC)[i] = RV(0x4900 + i);
-    for (uint32_t i = 0; i < 32; ++i) reinterpret_cast<uint32_t*>(c->loop)[i] = RV(0x4908 + i);
+    // M8: copia directa del fichero de registros (antes ~2300 llamadas a RegRead por draw)
+    std::memcpy(c->vsFloat, rt::gpu::g_regFile + 0x4000, 1024 * 4);
+    std::memcpy(c->psFloat, rt::gpu::g_regFile + 0x4400, 1024 * 4);
+    std::memcpy(c->fetch, rt::gpu::g_regFile + 0x4800, 192 * 4);
+    std::memcpy(c->boolC, rt::gpu::g_regFile + 0x4900, 8 * 4);
+    std::memcpy(c->loop, rt::gpu::g_regFile + 0x4908, 32 * 4);
     c->draw0[0] = prim; c->draw0[1] = ev.src; c->draw0[2] = ev.indexSize; c->draw0[3] = ev.dmaSize >> 30;
     c->draw1[0] = ev.dmaBase & 0x1FFFFFFF; c->draw1[1] = n; c->draw1[2] = RV(0x2102) & 0xFFFFFF; c->draw1[3] = 0;
     {
@@ -450,16 +461,17 @@ bool D3D12Backend::DoDraw(const DrawEvent& ev, const ShaderInfo* vs, const Shade
                 ww[0], hs[0], ww[1], hs[1], ww[2], hs[2], (int)okp, b0[0], b0[1], b0[2], sy.size(), su.size(), sv.size(), (unsigned long long)n);
     }
     // ---- descriptores: texturas y muestreadores ----
-    uint32_t base = AllocGpuSrv(96);
-    D3D12_CPU_DESCRIPTOR_HANDLE cpuStart = cpuSrvHeap->GetCPUDescriptorHandleForHeapStart();
-    D3D12_CPU_DESCRIPTOR_HANDLE dstStart = gpuSrvHeap->GetCPUDescriptorHandleForHeapStart();
-    D3D12_GPU_DESCRIPTOR_HANDLE gpuStart = gpuSrvHeap->GetGPUDescriptorHandleForHeapStart();
-    D3D12_CPU_DESCRIPTOR_HANDLE src[96];
+    // M8: las texturas se obtienen antes de reservar descriptores: GetTexture puede vaciar la lista (FlushAndWait reinicia gpuSrvNext)
     uint32_t texMask = vs->tfetchMask | (ps ? ps->tfetchMask : 0);
     HostTexture* texs[32] = {};
     for (uint32_t i = 0; i < 32; ++i) {
         if (texMask & (1u << i)) texs[i] = GetTexture(i, (vs->tfetchMask & (1u << i)) != 0 && !(ps && (ps->tfetchMask & (1u << i))));
     }
+    uint32_t base = AllocGpuSrv(96);
+    D3D12_CPU_DESCRIPTOR_HANDLE cpuStart = cpuSrvHeap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_CPU_DESCRIPTOR_HANDLE dstStart = gpuSrvHeap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_GPU_DESCRIPTOR_HANDLE gpuStart = gpuSrvHeap->GetGPUDescriptorHandleForHeapStart();
+    D3D12_CPU_DESCRIPTOR_HANDLE src[96];
     for (uint32_t i = 0; i < 32; ++i) {
         for (uint32_t d = 0; d < 3; ++d) {
             uint32_t idx = d == 0 ? nullSrv2D : d == 1 ? nullSrv3D : nullSrvCube;
@@ -476,16 +488,27 @@ bool D3D12Backend::DoDraw(const DrawEvent& ev, const ShaderInfo* vs, const Shade
     // muestreadores (tabla de 32, con cache por contenido)
     D3D12_SAMPLER_DESC smp[32];
     for (uint32_t i = 0; i < 32; ++i) smp[i] = SamplerFromFetch(i);
-    std::string skey((const char*)smp, sizeof(smp));
-    uint32_t smpBase;
-    auto sit = samplerTables.find(skey);
-    if (sit != samplerTables.end()) smpBase = sit->second;
-    else {
+    uint32_t smpBase = 0;
+    uint64_t shash = FastHash(smp, sizeof(smp));
+    bool smpFound = false;
+    {
+        auto range = samplerFast.equal_range(shash);
+        for (auto r = range.first; r != range.second; ++r)
+            if (!std::memcmp(r->second.desc.data(), smp, sizeof(smp))) { smpBase = r->second.base; smpFound = true; break; }
+    }
+    std::string skey;
+    if (!smpFound) {
+        skey.assign((const char*)smp, sizeof(smp));
+        auto sit = samplerTables.find(skey);
+        if (sit != samplerTables.end()) { smpBase = sit->second; smpFound = true; samplerFast.emplace(shash, SmpFast{skey, smpBase}); }
+    }
+    if (!smpFound) {
         if (gpuSmpNext + 32 > kSamplerHeapSize) { FlushAndWait(); }
         smpBase = gpuSmpNext; gpuSmpNext += 32;
         D3D12_CPU_DESCRIPTOR_HANDLE h = gpuSmpHeap->GetCPUDescriptorHandleForHeapStart();
         for (uint32_t i = 0; i < 32; ++i) { D3D12_CPU_DESCRIPTOR_HANDLE hh = {h.ptr + (SIZE_T)(smpBase + i) * smpInc}; dev->CreateSampler(&smp[i], hh); }
         samplerTables[skey] = smpBase;
+        samplerFast.emplace(shash, SmpFast{skey, smpBase});
     }
     // ---- estado y draw ----
     for (uint32_t i = 0; i < nrt; ++i) {

@@ -55,19 +55,16 @@ target_compile_options(SwapForceRT PRIVATE
 target_compile_definitions(SwapForceRT PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 
 # Pila del hilo principal grande (la recompilacion produce llamadas anidadas profundas).
-target_link_options(SwapForceRT PRIVATE /STACK:268435456 /SUBSYSTEM:CONSOLE /INCREMENTAL:NO /MAP:SwapForceRT.map)
+# M8: tablas de lineas solo para el runtime (perfilado con llvm-symbolizer); /OPT:REF,ICF = valores por defecto sin /DEBUG
+set_source_files_properties(${RT_SOURCES} PROPERTIES COMPILE_OPTIONS "/Z7;/clang:-gline-tables-only")
+target_link_options(SwapForceRT PRIVATE /STACK:268435456 /SUBSYSTEM:CONSOLE /INCREMENTAL:NO /MAP:SwapForceRT.map /DEBUG /OPT:REF /OPT:ICF)
 target_link_libraries(SwapForceRT PRIVATE)
 
 set(SWAPFORCE_OUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/build" CACHE PATH "Directorio de salida del ejecutable")
 set_target_properties(SwapForceRT PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${SWAPFORCE_OUT_DIR}")
 
 # DXC (H2): compilador HLSL -> DXIL junto al ejecutable (de la copia de XenosRecomp, MIT/NCSA)
-# Orden: DXC descargado por setup.ps1 (tools/dxc), si no, la copia de XenosRecomp del arbol de desarrollo.
-if(EXISTS "${SWAPFORCE_ROOT}/tools/dxc/bin/x64/dxcompiler.dll")
-  set(DXC_BIN "${SWAPFORCE_ROOT}/tools/dxc/bin/x64")
-else()
-  set(DXC_BIN "${SWAPFORCE_ROOT}/tools/XenosRecomp/thirdparty/dxc-bin/bin/x64")
-endif()
+set(DXC_BIN "${SWAPFORCE_ROOT}/tools/XenosRecomp/thirdparty/dxc-bin/bin/x64")
 add_custom_command(TARGET SwapForceRT POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DXC_BIN}/dxcompiler.dll" "$<TARGET_FILE_DIR:SwapForceRT>/dxcompiler.dll"
   COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DXC_BIN}/dxil.dll" "$<TARGET_FILE_DIR:SwapForceRT>/dxil.dll")

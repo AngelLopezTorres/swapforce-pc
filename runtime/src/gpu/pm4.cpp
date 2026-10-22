@@ -3,6 +3,9 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
+#include <windows.h>
+#include "perf.h"
 
 namespace rt::gpu {
 
@@ -132,6 +135,7 @@ bool Pm4Parser::Type3(Reader& r, uint32_t pkt, int depth) {
             r.Skip(count); break;
         case PM4_INTERRUPT: {
             uint32_t mask = r.Read();
+            host_->SyncPoint();
             Line("INTERRUPT cpu_mask=0x%X", mask);
             host_->Interrupt(mask);
             break;
@@ -140,6 +144,7 @@ bool Pm4Parser::Type3(Reader& r, uint32_t pkt, int depth) {
             uint32_t magic = r.Read(), fb = r.Read(), w = r.Read(), h = r.Read();
             r.Skip(count - 4);
             Line("XE_SWAP magic=%08X fb=%08X %ux%u", magic, fb, w, h);
+            host_->SyncPoint();
             host_->Swap(fb, w, h);
             EndFrame();
             break;
@@ -157,6 +162,7 @@ bool Pm4Parser::Type3(Reader& r, uint32_t pkt, int depth) {
         case PM4_WAIT_REG_MEM: {
             uint32_t wi = r.Read(), addr = r.Read(), ref = r.Read(), mask = r.Read(), wait = r.Read();
             Line("WAIT_REG_MEM info=%X addr=%08X ref=%X mask=%X", wi, addr, ref, mask);
+            host_->SyncPoint();
             ok = Wait(wi, addr, ref, mask, wait);
             break;
         }
@@ -171,11 +177,14 @@ bool Pm4Parser::Type3(Reader& r, uint32_t pkt, int depth) {
         case PM4_REG_TO_MEM: {
             uint32_t reg = r.Read(), mem = r.Read();
             uint32_t v = GpuSwap32(host_->ReadReg(reg), mem & 3);
-            if (uint8_t* p = host_->Phys(mem & ~3u, 4)) std::memcpy(p, &v, 4);
+            host_->SyncPoint();
+            if (uint8_t* p = host_->Phys(mem & ~3u, 4)) { std::memcpy(p, &v, 4); host_->MemWritten(mem & ~3u, 4); }
             break;
         }
         case PM4_MEM_WRITE: {
             uint32_t addr = r.Read();
+            host_->SyncPoint();
+            if (count > 1) host_->MemWritten(addr & ~3u, (count - 1) * 4);
             for (uint32_t i = 0; i + 1 < count; ++i) {
                 uint32_t d = GpuSwap32(r.Read(), addr & 3);
                 if (uint8_t* p = host_->Phys(addr & ~3u, 4)) std::memcpy(p, &d, 4);
@@ -193,7 +202,8 @@ bool Pm4Parser::Type3(Reader& r, uint32_t pkt, int depth) {
             if (Compare(wi, value, mask, ref)) {
                 if (wi & 0x100) {
                     uint32_t d = GpuSwap32(wd, wa & 3);
-                    if (uint8_t* p = host_->Phys(wa & ~3u, 4)) std::memcpy(p, &d, 4);
+                    host_->SyncPoint();
+                    if (uint8_t* p = host_->Phys(wa & ~3u, 4)) { std::memcpy(p, &d, 4); host_->MemWritten(wa & ~3u, 4); }
                 } else host_->WriteReg(wa, wd);
             }
             break;
@@ -209,7 +219,8 @@ bool Pm4Parser::Type3(Reader& r, uint32_t pkt, int depth) {
             host_->WriteReg(REG_VGT_EVENT_INITIATOR, init & 0x3F);
             uint32_t d = ((init >> 31) & 1) ? (uint32_t)host_->Counter() : value;
             d = GpuSwap32(d, addr & 3);
-            if (uint8_t* p = host_->Phys(addr & ~3u, 4)) std::memcpy(p, &d, 4);
+            host_->SyncPoint();
+            if (uint8_t* p = host_->Phys(addr & ~3u, 4)) { std::memcpy(p, &d, 4); host_->MemWritten(addr & ~3u, 4); }
             break;
         }
         case PM4_EVENT_WRITE_EXT: {
@@ -218,8 +229,11 @@ bool Pm4Parser::Type3(Reader& r, uint32_t pkt, int depth) {
             // Xenia: extents fijos {0, 8192>>3, 0, 8192>>3, 0, 1} en 16 bits con intercambio de bytes
             // (valor 8192 de kTexture2DCubeMaxWidthHeight: [NV]).
             static const uint16_t ext[6] = {0, 8192 >> 3, 0, 8192 >> 3, 0, 1};
-            if (uint8_t* p = host_->Phys(addr & ~3u, 12))
+            host_->SyncPoint();
+            if (uint8_t* p = host_->Phys(addr & ~3u, 12)) {
                 for (int i = 0; i < 6; ++i) { uint16_t v = __builtin_bswap16(ext[i]); std::memcpy(p + i * 2, &v, 2); }
+                host_->MemWritten(addr & ~3u, 12);
+            }
             r.Skip(count - 2);
             break;
         }
@@ -317,7 +331,31 @@ bool Pm4Parser::Type3(Reader& r, uint32_t pkt, int depth) {
     return ok;
 }
 
+// M8: tiempo de espera de WAIT_REG_MEM por direccion (solo con --perf)
+struct WaitAcc { std::atomic<uint32_t> addr{0}; std::atomic<uint64_t> ticks{0}, n{0}, maxT{0}; };
+static WaitAcc g_waitAcc[32];
+void Pm4WaitReport(void (*out)(const char*)) {
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+    for (auto& w : g_waitAcc) {
+        if (!w.n) continue;
+        char b[200];
+        std::snprintf(b, sizeof(b), "PERF cp_wait addr=%08X n=%llu total_ms=%.1f media_us=%.1f max_ms=%.2f", w.addr.load(), (unsigned long long)w.n.load(),
+                      w.ticks * 1000.0 / f.QuadPart, w.ticks * 1e6 / f.QuadPart / w.n, w.maxT * 1000.0 / f.QuadPart);
+        out(b);
+    }
+}
 bool Pm4Parser::Wait(uint32_t wi, uint32_t pa, uint32_t ref, uint32_t mask, uint32_t wait) {
+    struct T { uint32_t pa; uint64_t t0; ~T() {
+        if (!perf::g_enabled) return;
+        uint64_t d = perf::Now() - t0;
+        for (auto& w : g_waitAcc) {
+            uint32_t a = w.addr.load();
+            if (a == 0) { uint32_t z = 0; if (!w.addr.compare_exchange_strong(z, pa) && z != pa) continue; }
+            else if (a != pa) continue;
+            w.ticks += d; ++w.n; if (d > w.maxT) w.maxT = d;
+            break;
+        }
+    } } tm{pa, perf::g_enabled ? perf::Now() : 0};
     (void)wait;
     bool mem = (wi & 0x10) != 0;
     for (;;) {

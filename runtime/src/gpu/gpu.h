@@ -13,6 +13,9 @@ struct Config {
     uint32_t logPerFrame = 48;     // lineas de paquetes por fotograma en gpu.log (los DRAWSTATE y resumenes no tienen limite)
     std::string logPath = "gpu.log";
     bool stateLog = false;         // --gpu-statelog: una linea DRAWSTATE por draw en gpu.log
+    bool shaderScan = false;       // M8: --shader-scan (barrido de contenedores de shaders a 10 s, 30 s y al final)
+    std::string framesDir;         // M8: --frames-dir
+    bool hist = false;             // M8: --gpu-hist (o --gpu-statelog): histogramas H0 por draw (TEXFMT/VTXFMT/...); antes siempre activos
     bool dumpFb = false;           // --dump-fb: destila el frontbuffer por CPU en cada XE_SWAP (nonblack_px, hash)
     std::string fbFrames;          // --fb-frames N[,M..]: fotogramas del frontbuffer que se escriben como PNG
     bool noD3d = false;            // --no-d3d: sin backend de dibujo (solo CP/analisis)
@@ -26,6 +29,7 @@ struct Config {
     std::string dumpFrames;        // --dump-frames N[,M..]: PNG del fotograma renderizado por el backend
 };
 Config& Cfg();
+std::string FramesDir();   // M8: --frames-dir DIR (por defecto runtime/userdata/frames)
 
 void Start();                      // valores por defecto de registros + hilos CP y vsync
 void Stop();
@@ -48,7 +52,8 @@ uint8_t* PhysHost(uint32_t phys, uint32_t bytes);   // nullptr si algun byte no 
 uint32_t VirtToPhys(uint32_t virt);                  // Xenia: direcciones >= 0xA0000000 -> & 0x1FFFFFFF
 
 // Fichero de registros interno (orden del host).
-uint32_t RegRead(uint32_t idx);
+extern const uint32_t* g_regFile;   // M8: fichero de registros (kRegCount = 0x5003 entradas)
+inline uint32_t RegRead(uint32_t idx) { return idx < 0x5003u ? g_regFile[idx] : 0; }
 void RegWriteCpu(uint32_t idx, uint32_t v);          // escritura desde el CP: refleja en la pagina guest si idx < 0x4000
 
 void GpuLog(const char* line);                       // linea en gpu.log

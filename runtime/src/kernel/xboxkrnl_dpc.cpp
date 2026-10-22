@@ -9,6 +9,7 @@
 #include <mutex>
 #include <set>
 
+#include "perf.h"
 #include "guest_abi.h"
 #include "guest_thread.h"
 #include "import_log.h"
@@ -24,6 +25,7 @@ HANDLE g_event = nullptr, g_thread = nullptr;
 std::atomic<uint64_t> g_executed{0};
 
 DWORD WINAPI DpcMain(void*) {
+    rt::perf::NameCurrentThread("dpc");
     GuestThread* t = GuestThread::CreateAttached("dpc");
     if (!t) return 1;
     t->Attach();

@@ -1,3 +1,5 @@
+#include "perf.h"
+#include "fast_hash.h"
 // H5: texturas del guest -> texturas D3D12. Destilado (detiling) con xenia/gpu/texture_address.h, endian y formato segun la
 // constante de fetch (xe_gpu_texture_fetch_t de xenos.h). Solo nivel base (sin mips) en esta version.
 #include <algorithm>
@@ -12,15 +14,66 @@
 
 namespace rt::gpu::d3d {
 
+bool g_texSlowPath = false;   // M8: --tex-slow-path (camino por bloque original, para comparar)
+bool g_texVerify = false;
+bool g_texMemoOff = false;    // M8: --no-tex-memo
+bool g_verifyShortcut = false;   // M8: --verify-shortcut
+
+// M8: lee de la GPU ambas texturas y compara: byte k de la textura del camino CPU == byte perm[k] de la copia del RT.
+void D3D12Backend::VerifyShortcut(HostTexture* gpuTex, HostTexture* cpuTex, uint32_t base, uint32_t w, uint32_t h, uint32_t fmt) {
+    static uint64_t ok = 0, bad = 0, skipped = 0;
+    ResolvedTex* rtp = nullptr;
+    for (auto& kv : resolvedTex) if (&kv.second.ht == gpuTex) rtp = &kv.second;
+    if (!cpuTex || !rtp || !cpuTex->res) { ++skipped; return; }
+    uint32_t rowPitch = (w * 4 + 255) & ~255u;
+    uint64_t bytes = (uint64_t)rowPitch * h;
+    D3D12_HEAP_PROPERTIES rp = {D3D12_HEAP_TYPE_READBACK};
+    D3D12_RESOURCE_DESC bd = {};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = bytes * 2; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> rb;
+    if (!Hr(dev->CreateCommittedResource(&rp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&rb)), "verify readback")) return;
+    const D3D12_RESOURCE_STATES srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    ID3D12Resource* rs[2] = {cpuTex->res.Get(), gpuTex->res.Get()};
+    DXGI_FORMAT fm[2] = {cpuTex->res->GetDesc().Format, gpuTex->res->GetDesc().Format};
+    for (int i = 0; i < 2; ++i) {
+        Transition(rs[i], srv, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION d = {}, s = {};
+        d.pResource = rb.Get(); d.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        d.PlacedFootprint.Offset = (uint64_t)i * bytes;
+        d.PlacedFootprint.Footprint = {fm[i], w, h, 1, rowPitch};
+        s.pResource = rs[i]; s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; s.SubresourceIndex = 0;
+        cl->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
+        Transition(rs[i], D3D12_RESOURCE_STATE_COPY_SOURCE, srv);
+    }
+    FlushAndWait();
+    void* p = nullptr;
+    D3D12_RANGE r = {0, (SIZE_T)(bytes * 2)};
+    if (!Hr(rb->Map(0, &r, &p), "verify map")) return;
+    const uint8_t* a = (const uint8_t*)p;
+    const uint8_t* g = a + bytes;
+    static const uint32_t permId[4] = {0, 1, 2, 3}, permSwap[4] = {2, 1, 0, 3};
+    const uint32_t* perm = (fmt == 6 && rtp->swapRB) ? permSwap : permId;
+    uint64_t diff = 0;
+    for (uint32_t y = 0; y < h; ++y)
+        for (uint32_t x = 0; x < w; ++x) {
+            const uint8_t* pa = a + (size_t)y * rowPitch + x * 4;
+            const uint8_t* pg = g + (size_t)y * rowPitch + x * 4;
+            for (int k = 0; k < 4; ++k) if (pa[k] != pg[perm[k]]) { ++diff; break; }
+        }
+    D3D12_RANGE wz = {0, 0};
+    rb->Unmap(0, &wz);
+    ++(diff ? bad : ok);
+    if (diff || ok <= 5 || ok % 200 == 0)
+        ImportLog::Get().Printf("M8 verify-shortcut base=%08X %ux%u fmt=%u swapRB=%u -> %s (pixeles distintos=%llu; ok=%llu mal=%llu omitidas=%llu)", base, w, h, fmt,
+                                (unsigned)rtp->swapRB, diff ? "DISTINTO" : "IGUAL", (unsigned long long)diff, (unsigned long long)ok, (unsigned long long)bad, (unsigned long long)skipped);
+}     // M8: --tex-verify (ejecuta ambos caminos y compara byte a byte)
+static uint64_t texVerifyOk = 0, texVerifyBad = 0;
 extern uint64_t g_memoryEpoch;
 uint64_t g_memoryEpoch = 0;
 
 static uint64_t Fnv(const uint8_t* p, size_t n, uint64_t h = 1469598103934665603ull) {
-    const uint64_t* q = reinterpret_cast<const uint64_t*>(p);
-    size_t k = n / 8;
-    for (size_t i = 0; i < k; ++i) { h ^= q[i]; h *= 1099511628211ull; }
-    for (size_t i = k * 8; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
-    return h;
+    return FastHash(p, n, h);   // M8: hash vectorial (antes FNV-1a de 64 bits en cadena)
 }
 
 D3D12_SAMPLER_DESC D3D12Backend::SamplerFromFetch(uint32_t idx) {
@@ -95,6 +148,75 @@ static bool GetFmt(uint32_t f, FmtInfo& o) {
 
 static uint32_t Log2u(uint32_t v) { uint32_t l = 0; while ((1u << (l + 1)) <= v) ++l; return l; }
 
+// M8: comprobacion (una vez por bpbLog2) de que Tiled2D coloca contiguos los bloques de cada grupo alineado de 16 bytes
+// (16 >> bpbLog2 bloques consecutivos en x a direcciones consecutivas). Si se cumple, el destilado copia tramos de 16 bytes;
+// si no, se usa el camino bloque a bloque original. Comprobado sobre 128x96 bloques con 3 pitch distintos.
+static bool TiledRunsContiguous(uint32_t bpbLog2) {
+    static int cache[5] = {-1, -1, -1, -1, -1};
+    if (bpbLog2 > 4) return false;
+    if (cache[bpbLog2] >= 0) return cache[bpbLog2] != 0;
+    uint32_t run = std::max(1u, 16u >> bpbLog2), bpb = 1u << bpbLog2;
+    bool ok = true;
+    const uint32_t pitches[3] = {32, 128, 1280};
+    for (uint32_t pi = 0; pi < 3 && ok; ++pi)
+        for (int32_t y = 0; y < 96 && ok; ++y)
+            for (int32_t x = 0; x < 128 && ok; x += (int32_t)run) {
+                int32_t o0 = xe::gpu::texture_address::Tiled2D(x, y, pitches[pi], bpbLog2);
+                for (uint32_t i = 1; i < run; ++i)
+                    if (xe::gpu::texture_address::Tiled2D(x + (int32_t)i, y, pitches[pi], bpbLog2) != o0 + (int32_t)(i * bpb)) { ok = false; break; }
+            }
+    cache[bpbLog2] = ok ? 1 : 0;
+    ImportLog::Get().Printf("M8 destilado: Tiled2D bpbLog2=%u tramos contiguos de %u bloques -> %s", bpbLog2, run, ok ? "SI (camino rapido)" : "NO (camino por bloque)");
+    return ok;
+}
+
+// Copia las filas de bloques de una cara (destilado) a dst (rowPitch bytes por fila), bloques en bruto de bpb bytes.
+static void DetileRaw(uint8_t* dst, uint32_t rowPitch, const uint8_t* lm, uint32_t wBlocks, uint32_t hBlocks, bool tiled,
+                      uint32_t pitchAligned, uint32_t bpbLog2, uint32_t linPitchBytes) {
+    uint32_t bpb = 1u << bpbLog2;
+    if (!tiled) {
+        for (uint32_t by = 0; by < hBlocks; ++by) std::memcpy(dst + (size_t)by * rowPitch, lm + (size_t)by * linPitchBytes, (size_t)wBlocks * bpb);
+        return;
+    }
+    uint32_t run = std::max(1u, 16u >> bpbLog2);
+    bool fast = TiledRunsContiguous(bpbLog2);
+    for (uint32_t by = 0; by < hBlocks; ++by) {
+        uint8_t* d = dst + (size_t)by * rowPitch;
+        if (fast) {
+            for (uint32_t bx = 0; bx < wBlocks; bx += run) {
+                uint32_t n = std::min(run, wBlocks - bx);
+                size_t off = (size_t)xe::gpu::texture_address::Tiled2D((int32_t)bx, (int32_t)by, pitchAligned, bpbLog2);
+                if (n == run && run * bpb == 16) std::memcpy(d + (size_t)bx * bpb, lm + off, 16);
+                else std::memcpy(d + (size_t)bx * bpb, lm + off, (size_t)n * bpb);
+            }
+        } else {
+            for (uint32_t bx = 0; bx < wBlocks; ++bx) {
+                size_t off = (size_t)xe::gpu::texture_address::Tiled2D((int32_t)bx, (int32_t)by, pitchAligned, bpbLog2);
+                std::memcpy(d + (size_t)bx * bpb, lm + off, bpb);
+            }
+        }
+    }
+}
+
+// Endian por palabras en una fila (misma semantica que el camino por bloque: bpb>=4 -> GpuSwap32 por palabra de 32 bits;
+// bpb==2 -> intercambio de los 2 bytes del texel con endian 1 o 2; bpb==1 -> nada).
+static void SwapRow(uint8_t* d, size_t bytes, uint32_t bpb, uint32_t endian) {
+    if (!endian) return;
+    if (bpb >= 4) {
+        size_t n = bytes / 4;
+        uint32_t* w = reinterpret_cast<uint32_t*>(d);
+        switch (endian) {
+            case 1: for (size_t i = 0; i < n; ++i) { uint32_t v = w[i]; w[i] = ((v << 8) & 0xFF00FF00u) | ((v >> 8) & 0x00FF00FFu); } break;
+            case 2: for (size_t i = 0; i < n; ++i) w[i] = __builtin_bswap32(w[i]); break;
+            case 3: for (size_t i = 0; i < n; ++i) { uint32_t v = w[i]; w[i] = (v >> 16) | (v << 16); } break;
+        }
+    } else if (bpb == 2 && (endian == 1 || endian == 2)) {
+        size_t n = bytes / 2;
+        uint16_t* h = reinterpret_cast<uint16_t*>(d);
+        for (size_t i = 0; i < n; ++i) h[i] = __builtin_bswap16(h[i]);
+    }
+}
+
 // ---- volcado de depuracion (solo para --dump-textures): descompresion BC1/BC2/BC3 en CPU ----
 static void Bc1Block(const uint8_t* b, uint8_t out[16][4], bool opaqueOnly) {
     uint16_t c0 = b[0] | (b[1] << 8), c1 = b[2] | (b[3] << 8);
@@ -139,6 +261,7 @@ static void DecodeBcToRgba(uint32_t fmt, const uint8_t* lin, uint32_t rowPitch, 
 }
 
 HostTexture* D3D12Backend::GetTexture(uint32_t idx, bool vertexStage) {
+    PERF_ZONE(kZoneTexUpload);
     (void)vertexStage;
     uint32_t w6[6];
     for (int i = 0; i < 6; ++i) w6[i] = RV(0x4800 + idx * 6 + i);
@@ -180,11 +303,41 @@ HostTexture* D3D12Backend::GetTexture(uint32_t idx, bool vertexStage) {
         maxOff = std::max<int64_t>(maxOff, xe::gpu::texture_address::Tiled2D((int32_t)wBlocks - 1, (int32_t)hBlocks - 1, pitchAligned, bpbLog2));
         needBytes = (uint64_t)maxOff + fi.bpb + (layers > 1 ? faceBytes * (layers - 1) : 0);
     }
+    // M8: lectura de un resolve del mismo fotograma con coincidencia exacta -> copia GPU del RT (sin memoria guest)
+    if (dimension == 1 && layers == 1 && depth == 1 && tiled && !((uint32_t)tf.sign_x == 3 && fi.dxgi != fi.srgb))
+        if (!shortcutVerifyActive)
+            if (HostTexture* rtx = LookupResolvedTex(baseAddr, width, height, fmtId, endian, pitchAligned, (uint32_t)tf.swizzle)) {
+                if (g_verifyShortcut) {   // M8: --verify-shortcut
+                    shortcutVerifyActive = true;
+                    HostTexture* cpuTex = GetTexture(idx, vertexStage);
+                    shortcutVerifyActive = false;
+                    VerifyShortcut(rtx, cpuTex, baseAddr, width, height, fmtId);
+                }
+                return rtx;
+            }
+    // si la memoria a leer tiene resolves pendientes de escribir, se completan antes (exactitud)
+    FlushResolvesIfOverlap(baseAddr, (uint32_t)std::min<uint64_t>((uint64_t)baseAddr + needBytes, 0x20000000ull));
     const uint8_t* mem = PhysHost(baseAddr, (uint32_t)needBytes);
+    ++fTexCalls;
+    if (SeqLog()) ImportLog::Get().Printf("M8SEQ draw=%llu TEX fetch=%u base=%08X bytes=%llu %ux%u fmt=%s tiled=%u endian=%u", (unsigned long long)drawSerial, idx, baseAddr, (unsigned long long)needBytes, width, height, TexFmtName(fmtId), (unsigned)tiled, endian);
+    for (auto& fr : frameResolves)
+        if (baseAddr < fr.hi && baseAddr + needBytes > fr.lo) {
+            ++fTexOverlap;
+            if (fr.destBase == baseAddr && fr.fmt == fmtId && fr.endian == endian && fr.x0 == 0 && fr.y0 == 0 && width <= fr.w && height <= fr.h && tiled) ++fTexExact;
+            break;
+        }
     if (!mem) { ++texFail; ++fTexFail; Note("OMISION textura en memoria no asignada"); return nullptr; }
-    uint64_t dataHash = Fnv(mem, (size_t)needBytes);
     uint64_t key = Fnv((const uint8_t*)w6, 16) ^ ((uint64_t)w6[4] << 7) ^ ((uint64_t)w6[5] << 31);   // direccion y descriptor (sin la dir. de mip)
     key ^= (uint64_t)baseAddr * 0x9E3779B97F4A7C15ull;
+    uint64_t dataHash;
+    uint64_t memoKey = key ^ (needBytes * 0xC2B2AE3D27D4EB4Full);
+    auto mit = g_texMemoOff ? texMemo.end() : texMemo.find(memoKey);
+    if (mit != texMemo.end()) { dataHash = mit->second.hash; ++texMemoHits; }
+    else {
+        dataHash = Fnv(mem, (size_t)needBytes);
+        ++texMemoMiss;
+        if (!g_texMemoOff) texMemo[memoKey] = {baseAddr, (uint32_t)std::min<uint64_t>((uint64_t)baseAddr + needBytes, 0xFFFFFFFFull), dataHash};
+    }
     auto it = textures.find(key);
     if (it != textures.end() && it->second.dataHash == dataHash && it->second.res) { it->second.lastUse = ++texSerial; ++texHits; return &it->second; }
     // ---- conversion a datos lineales del host ----
@@ -195,8 +348,26 @@ HostTexture* D3D12Backend::GetTexture(uint32_t idx, bool vertexStage) {
     uint32_t rowBytes = wBlocks * hostBpb;
     uint32_t rowPitch = (rowBytes + 255) & ~255u;
     uint32_t layerPitchRows = hBlocks;
-    std::vector<uint8_t> lin((size_t)rowPitch * hBlocks * layers);
-    for (uint32_t L = 0; L < layers; ++L) {
+    uint64_t m8t0 = perf::Now();
+    std::vector<uint8_t>& lin = texScratch;   // M8: bufer reutilizado (antes un vector nuevo por subida)
+    lin.resize((size_t)rowPitch * hBlocks * layers);
+    bool fastPath = (fi.expand == 0 || ((fi.expand == 4 || fi.expand == 5) && fi.bpb == 4)) && !g_texSlowPath;
+    if (fastPath) {   // M8: destilado por tramos + endian por fila (resultado identico al camino por bloque)
+        for (uint32_t L = 0; L < layers; ++L) {
+            uint8_t* dl = &lin[(size_t)L * layerPitchRows * rowPitch];
+            DetileRaw(dl, rowPitch, mem + faceBytes * L, wBlocks, hBlocks, tiled, pitchAligned, bpbLog2, pitchPx / bw * fi.bpb);
+            if (endian) for (uint32_t by = 0; by < hBlocks; ++by) SwapRow(dl + (size_t)by * rowPitch, (size_t)wBlocks * fi.bpb, fi.bpb, endian);
+            if (fi.expand == 4 || fi.expand == 5)   // M8: conversion de profundidad por fila (mismas expresiones que el camino por bloque)
+                for (uint32_t by = 0; by < hBlocks; ++by) {
+                    uint32_t* row = reinterpret_cast<uint32_t*>(dl + (size_t)by * rowPitch);
+                    if (fi.expand == 4) for (uint32_t bx = 0; bx < wBlocks; ++bx) { float f = (float)(row[bx] >> 8) / 16777215.0f; std::memcpy(&row[bx], &f, 4); }
+                    else for (uint32_t bx = 0; bx < wBlocks; ++bx) { float f = xenos::Float20e4To32(row[bx] >> 8); std::memcpy(&row[bx], &f, 4); }
+                }
+        }
+    }
+    std::vector<uint8_t> fastCopy;
+    if (fastPath && g_texVerify) { fastCopy = lin; fastPath = false; }   // M8: --tex-verify compara con el camino por bloque
+    for (uint32_t L = 0; L < layers && !fastPath; ++L) {
         const uint8_t* lm = mem + faceBytes * L;
         for (uint32_t by = 0; by < hBlocks; ++by) {
             uint8_t* dst = &lin[((size_t)L * layerPitchRows + by) * rowPitch];
@@ -226,10 +397,22 @@ HostTexture* D3D12Backend::GetTexture(uint32_t idx, bool vertexStage) {
             }
         }
     }
+    if (!fastCopy.empty()) {
+        bool same = true;
+        for (uint32_t L = 0; L < layers && same; ++L)
+            for (uint32_t by = 0; by < hBlocks && same; ++by) {
+                size_t o = ((size_t)L * layerPitchRows + by) * rowPitch;
+                if (std::memcmp(&fastCopy[o], &lin[o], (size_t)wBlocks * fi.bpb)) same = false;
+            }
+        ++(same ? texVerifyOk : texVerifyBad);
+        if (!same || texVerifyOk <= 3 || (texVerifyOk % 2000) == 0) ImportLog::Get().Printf("M8 tex-verify fmt=%s %ux%u tiled=%u endian=%u -> %s (ok=%llu mal=%llu)", TexFmtName(fmtId), width, height,
+                                                               (unsigned)tiled, endian, same ? "IGUAL" : "DISTINTO", (unsigned long long)texVerifyOk, (unsigned long long)texVerifyBad);
+    }
     // ---- recurso ----
     HostTexture& ht = textures[key];
     bool recreate = !ht.res || ht.w != width || ht.h != height || ht.dim != (cube ? 2u : 0u);
     if (recreate) {
+        PERF_ZONE(kZoneTexCreate);
         D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_DEFAULT};
         D3D12_RESOURCE_DESC rd = {};
         rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = (width + bw - 1) / bw * bw; rd.Height = (height + bh - 1) / bh * bh;
@@ -280,6 +463,7 @@ HostTexture* D3D12Backend::GetTexture(uint32_t idx, bool vertexStage) {
     }
     Transition(ht.res.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     ht.dataHash = dataHash; ht.lastUse = ++texSerial;
+    if (SeqLog()) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); ImportLog::Get().Printf("M8SEQ UPLOAD fetch=%u base=%08X %ux%u fmt=%s expand=%d bytes=%zu us=%.0f", idx, baseAddr, width, height, TexFmtName(fmtId), fi.expand, lin.size(), (perf::Now() - m8t0) * 1e6 / f.QuadPart); }
     ++texUploads;
     if (textureDumps < opt.dumpTextures) {
         std::vector<uint8_t> img;
@@ -296,8 +480,8 @@ HostTexture* D3D12Backend::GetTexture(uint32_t idx, bool vertexStage) {
                 for (size_t i = 0; i < img.size(); i += 4) { uint8_t c[4] = {img[i], img[i + 1], img[i + 2], img[i + 3]}; for (int k = 0; k < 4; ++k) img[i + k] = sw4[k] <= 3 ? c[sw4[k]] : (sw4[k] == 5 ? 255 : 0); }
             for (size_t i = 3; i < img.size(); i += 4) img[i] = 255;   // sin alfa para poder verlo
             char nm[128];
-            std::snprintf(nm, sizeof(nm), "\\userdata\\frames\\tex_%03u_%s_%ux%u_%08X.png", textureDumps, TexFmtName(fmtId), width, height, baseAddr);
-            std::string path = GetPaths().runtimeDir + nm;
+            std::snprintf(nm, sizeof(nm), "\\tex_%03u_%s_%ux%u_%08X.png", textureDumps, TexFmtName(fmtId), width, height, baseAddr);
+            std::string path = rt::gpu::FramesDir() + nm;
             bool okp = WritePngRGBA(path, width, height, img.data(), width * 4);
             ImportLog::Get().Printf("D3D12 volcado de textura -> %s %s", path.c_str(), okp ? "OK" : "FALLO");
         }

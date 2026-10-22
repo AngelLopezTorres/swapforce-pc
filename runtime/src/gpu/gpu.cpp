@@ -24,6 +24,7 @@
 #include "gpu_names.h"
 #include "image_io.h"
 #include "backend.h"
+#include "perf.h"
 #include "xenia/gpu/xenos.h"
 
 #pragma comment(lib, "winmm.lib")
@@ -31,6 +32,11 @@
 namespace rt::gpu {
 
 Config& Cfg() { static Config c; return c; }
+std::string FramesDir() {
+    std::string d = Cfg().framesDir.empty() ? GetPaths().runtimeDir + "\\userdata\\frames" : Cfg().framesDir;
+    CreateDirectoryA(d.c_str(), nullptr);
+    return d;
+}
 
 namespace backend {
 static Backend* g_b = nullptr;
@@ -152,6 +158,7 @@ struct CpHost : Pm4Host {
     void Swap(uint32_t fb, uint32_t w, uint32_t h) override {
         uint64_t n = ++g_frames;
         ++g_counter;
+        perf::OnFrame(n);
         ImportLog::Get().Printf("FRAME %llu fb=%08X %ux%u", (unsigned long long)n, fb, w, h);
         if (Cfg().dumpFb) DumpFrontbuffer(n, fb, w, h);
         if (backend::Get()) {
@@ -179,8 +186,8 @@ struct CpHost : Pm4Host {
         GpuLogLine(b);
         if (g_fbPngFrames.count((uint32_t)n)) {
             char name[64];
-            std::snprintf(name, sizeof(name), "\\userdata\\frames\\fb_%05llu.png", (unsigned long long)n);
-            std::string path = GetPaths().runtimeDir + name;
+            std::snprintf(name, sizeof(name), "\\fb_%05llu.png", (unsigned long long)n);
+            std::string path = rt::gpu::FramesDir() + name;
             bool ok = WritePngRGBA(path, w, h, rgba.data(), w * 4);
             ImportLog::Get().Printf("FBDUMP png %s -> %s nonblack_px=%llu", path.c_str(), ok ? "OK" : "FALLO", (unsigned long long)s.nonblack);
         }
@@ -230,14 +237,18 @@ struct CpHost : Pm4Host {
                           surf, color, depth, mode & 7, copy, ev.prim, ev.nIdx, ev.src, (unsigned long long)nd);
             GpuLogLine(b);
         }
+        if (!active[0].info) ++g_drawsNoVs;
+        if (!active[1].info) ++g_drawsNoPs;
+        if (!(Cfg().hist || Cfg().stateLog)) {   // M8: diagnostico H0 bajo demanda (snprintf + std::map por draw)
+            if (backend::Get()) backend::Get()->OnDraw(ev, active[0].info.get(), active[1].info.get());
+            return;
+        }
         char k[256];
         std::snprintf(k, sizeof(k), "EDRAMMODE mode=%u(%s)", mode & 7, EdramModeName(mode & 7)); Hist(k);
         std::snprintf(k, sizeof(k), "MSAA %s", MsaaName((surf >> 16) & 3)); Hist(k);
         std::snprintf(k, sizeof(k), "PRIM %u(%s) src=%u", ev.prim, PrimName(ev.prim), ev.src); Hist(k);
         std::snprintf(k, sizeof(k), "RTFMT color0=%s depth=%s mode=%u", ColorRtName((color >> 16) & 15), DepthRtName((depth >> 16) & 1), mode & 7); Hist(k);
         std::snprintf(k, sizeof(k), "SQCONST vs=%08X ps=%08X", g_regs[0x2307], g_regs[0x2308]); Hist(k);
-        if (!active[0].info) ++g_drawsNoVs;
-        if (!active[1].info) ++g_drawsNoPs;
         // solo las constantes de fetch referenciadas por el microcodigo activo
         for (int t = 0; t < 2; ++t) {
             if (!active[t].info) continue;
@@ -270,6 +281,8 @@ struct CpHost : Pm4Host {
         if (backend::Get()) backend::Get()->OnDraw(ev, active[0].info.get(), active[1].info.get());
     }
     void Log(const char* line) override { GpuLogLine(line); }
+    void MemWritten(uint32_t a, uint32_t n) override { if (backend::Get()) backend::Get()->MemWritten(a, n); }
+    void SyncPoint() override { if (backend::Get()) backend::Get()->SyncPoint(); }
     void FrameDone(const char* s) override { GpuLogLine(s); }
 };
 
@@ -284,6 +297,7 @@ bool SafeExecute(Pm4Parser* p, const uint8_t* ring, uint32_t cap, uint32_t rd, u
 }
 
 DWORD WINAPI CpMain(void*) {
+    perf::NameCurrentThread("gpu-cp");
     CpHost host;
     Pm4Parser parser(&host);
     parser.SetLogLimit(Cfg().logPerFrame);
@@ -297,6 +311,7 @@ DWORD WINAPI CpMain(void*) {
         if (w >= capD) { ImportLog::Get().Printf("RB: wptr=0x%X fuera del anillo (%u dwords), se usa modulo", w, capD); }
         uint32_t rd = g_rptr;
         SafeExecute(&parser, ring, ringBytes, rd, w);
+        if (backend::Get()) backend::Get()->SyncPoint();   // M8: antes de publicar el rptr (la CPU puede observar el fin del lote)
         uint32_t newR = w % capD;
         g_rptr = newR;
         uint32_t wb = g_wbPhys;
@@ -311,6 +326,7 @@ DWORD WINAPI CpMain(void*) {
 }
 
 DWORD WINAPI VsyncMain(void*) {
+    perf::NameCurrentThread("gpu-vsync");
     LARGE_INTEGER f, last, now;
     QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&last);
@@ -322,7 +338,9 @@ DWORD WINAPI VsyncMain(void*) {
             if (now.QuadPart - last.QuadPart > period * 4) last = now; // evita rafagas tras una pausa
             ++g_vblank;
             ++g_counter;               // Xenia: command_processor_->increment_counter()
-            if (g_vblank == 600 || g_vblank == 1800) ScanShaderContainers(g_vblank == 600 ? "10 s" : "30 s");
+            // M8: el barrido de contenedores de shaders (fase 4a, diagnostico) bloqueaba este hilo ~1 s a los 10 s y 30 s y, con el,
+            // las interrupciones de VBLANK que el juego usa para voltear: ahora solo con --shader-scan.
+            if (Cfg().shaderScan && (g_vblank == 600 || g_vblank == 1800)) ScanShaderContainers(g_vblank == 600 ? "10 s" : "30 s");
             DispatchInterrupt(0, 2);   // Xenia: DispatchInterruptCallback(0, 2)
         }
         Sleep(1);
@@ -501,6 +519,9 @@ uint8_t* PhysHost(uint32_t phys, uint32_t bytes) {
     uint8_t* h = base + 0xA0000000u + p;
     uint64_t end = (uint64_t)p + bytes;
     if (end > 0x20000000ull) return nullptr;
+    // M8: con las vistas A0/C0 sobre la seccion de 512 MB toda la memoria fisica esta confirmada (la seccion nunca se
+    // libera: Decommit solo pone a cero), por lo que VirtualQuery siempre devolveria MEM_COMMIT: se omite (llamada al sistema).
+    if (GuestMemory::PhysicalViewsMapped()) return h;
     // Comprobacion de memoria confirmada (por regiones).
     uint8_t* cur = h;
     uint8_t* stop = h + bytes;
@@ -536,7 +557,8 @@ void Summary() {
 
 uint32_t VirtToPhys(uint32_t v) { return v >= 0xA0000000u ? (v & 0x1FFFFFFF) : v; }
 
-uint32_t RegRead(uint32_t idx) { return idx < kRegCount ? g_regs[idx] : 0; }
+const uint32_t* g_regFile = g_regs;
+static_assert(kRegCount == 0x5003, "RegRead en linea (gpu.h) supone kRegCount = 0x5003");
 void RegWriteCpu(uint32_t idx, uint32_t v) {
     if (idx >= kRegCount) return;
     std::lock_guard<std::mutex> g(g_regMu);

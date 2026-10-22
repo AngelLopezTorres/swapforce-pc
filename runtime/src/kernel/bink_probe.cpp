@@ -16,6 +16,7 @@
 
 extern "C" PPC_FUNC(__imp__sub_82FC13C8);
 
+namespace rt { bool g_binkProbeOn = false; }
 namespace {
 std::atomic<uint64_t> g_n82FC13C8{0};
 
@@ -29,6 +30,7 @@ constexpr uint32_t kBinkLo = 0x8307E000, kBinkHi = 0x830A9EF4;
 ProbeSlot* Slots();
 
 inline void BinkHit(int i, PPCContext& ctx) {
+    if (!rt::g_binkProbeOn) return;   // M8: sondas solo con --bink-trace
     ProbeSlot& s = Slots()[i];
     s.n.fetch_add(1, std::memory_order_relaxed);
     uint32_t lr = (uint32_t)ctx.lr;
@@ -72,6 +74,7 @@ PPC_FUNC(sub_830804C8) {
     BinkHit(BINK_PROBE_IDX_830804C8, ctx);
     uint32_t b = ctx.r3.u32;
     __imp__sub_830804C8(ctx, base);
+    if (!rt::g_binkProbeOn) return;
     static std::atomic<uint32_t> n{0};
     uint32_t k = n.fetch_add(1);
     if (b && (k < 8 || (k % 100) == 0)) {

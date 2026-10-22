@@ -1,3 +1,4 @@
+#include "perf.h"
 #include "kernel_vars.h"
 
 #include <atomic>
@@ -94,6 +95,7 @@ void StartTimeStampBundleTimer() {
     };
     update();
     std::thread([update]() {
+        rt::perf::NameCurrentThread("timestamp-1ms");
         HANDLE tm = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
         if (tm) {
             LARGE_INTEGER due;

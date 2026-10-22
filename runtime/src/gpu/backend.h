@@ -19,7 +19,9 @@ public:
     virtual ~Backend() {}
     virtual void OnSwap(const SwapInfo& s) = 0;
     virtual void OnDraw(const DrawEvent& ev, const ShaderInfo* vs, const ShaderInfo* ps) = 0;
-    virtual void Shutdown() = 0;   // libera recursos y escribe el resumen en runtime.log
+    virtual void Shutdown() = 0;
+    virtual void MemWritten(uint32_t /*phys*/, uint32_t /*bytes*/) {}   // M8
+    virtual void SyncPoint() {}                                         // M8   // libera recursos y escribe el resumen en runtime.log
 };
 
 Backend* Get();

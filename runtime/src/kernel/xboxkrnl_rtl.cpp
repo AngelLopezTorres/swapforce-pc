@@ -3,6 +3,7 @@
 
 #include <cstring>
 #include <cwctype>
+#include <cwchar>
 #include <string>
 
 #include "guest_abi.h"
@@ -94,7 +95,14 @@ GUEST_IMPORT_IMPL(RtlRaiseException) {
         for (int i = 0; name && i < 64 && base[name + i]; ++i) s.push_back((char)base[name + i]);
         uint32_t tid = G32(base, rec + 0x1C);   // THREADNAME_INFO.dwThreadID: 0xFFFFFFFF = hilo que llama; si no, id devuelto por ExCreateThread
         GuestThread* gt = tid == 0xFFFFFFFFu ? GuestThread::Current() : GuestThread::ById(tid);
-        if (gt) std::strncpy(gt->dynName, s.c_str(), sizeof(gt->dynName) - 1);
+        if (gt) {
+            std::strncpy(gt->dynName, s.c_str(), sizeof(gt->dynName) - 1);
+            if (HANDLE h = gt == GuestThread::Current() ? GetCurrentThread() : gt->HostHandle()) {
+                wchar_t w[96];
+                std::swprintf(w, 96, L"g%u:%S", gt->id, s.c_str());
+                SetThreadDescription(h, w);
+            }
+        }
         ImportLog::Get().Printf("  RtlRaiseException 0x406D1388 nombre de hilo \"%s\"", s.c_str());
         return;
     }

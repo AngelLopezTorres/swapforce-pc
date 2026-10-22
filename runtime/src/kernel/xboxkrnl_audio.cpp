@@ -18,6 +18,7 @@
 #include <deque>
 #include <mutex>
 
+#include "perf.h"
 #include "guest_abi.h"
 #include "guest_heap.h"
 #include "guest_thread.h"
@@ -50,6 +51,7 @@ LONGLONG g_freq = 0;
 LONGLONG Now() { LARGE_INTEGER c; QueryPerformanceCounter(&c); return c.QuadPart; }
 
 DWORD WINAPI AudioMain(void*) {
+    rt::perf::NameCurrentThread("audio-worker");
     timeBeginPeriod(1);
     GuestThread* gt = GuestThread::CreateAttached("Audio Worker");
     if (!gt) { ImportLog::Get().Printf("AUDIO: no se pudo crear el contexto guest"); return 1; }

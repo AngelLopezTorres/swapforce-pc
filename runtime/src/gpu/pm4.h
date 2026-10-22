@@ -47,6 +47,8 @@ struct Pm4Host {
     virtual void Log(const char* line) = 0;                         // linea de gpu.log
     virtual void FrameDone(const char* summary) = 0;                // fin de fotograma (tras XE_SWAP)
     virtual void OnDraw(const DrawEvent&) {}                        // tras actualizar VGT_DRAW_INITIATOR/DMA
+    virtual void MemWritten(uint32_t /*phys*/, uint32_t /*bytes*/) {}   // M8: el CP escribio memoria guest (invalidacion de caches)
+    virtual void SyncPoint() {}                                     // M8: punto en que la CPU guest puede observar el trabajo previo
 };
 
 struct Pm4Stats {

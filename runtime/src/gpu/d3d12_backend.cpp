@@ -1,3 +1,8 @@
+#include "perf.h"
+#include "fast_hash.h"
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include "d3d12_impl.h"
 
 #include "config.h"
@@ -13,6 +18,7 @@ namespace rt::gpu::d3d {
 
 // ---- Hilo de interfaz: solo crea la ventana y bombea mensajes (nunca bloquea; DXGI puede enviar SendMessage a este hilo).
 //      Documentacion: "Multithreading and DXGI" (Microsoft Learn, dxgi-best-practices; copia en runtime\ref\).
+bool g_windowNoActivate = false;
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
         case WM_CLOSE: ImportLog::Get().Printf("UI: ventana cerrada por el usuario, se termina el proceso"); std::fflush(nullptr); ExitProcess(0); return 0;
@@ -21,6 +27,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);
 }
 static DWORD WINAPI UiMain(void* p) {
+    rt::perf::NameCurrentThread("d3d-ui");
     auto* self = static_cast<UiThread*>(p);
     WNDCLASSEXW wc = {sizeof(wc)};
     wc.lpfnWndProc = WndProc;
@@ -33,7 +40,8 @@ static DWORD WINAPI UiMain(void* p) {
     AdjustWindowRect(&r, style, FALSE);
     self->hwnd = CreateWindowExW(0, wc.lpszClassName, L"Skylanders Swap Force (PC port - runtime)", style, CW_USEDEFAULT, CW_USEDEFAULT,
                                  r.right - r.left, r.bottom - r.top, nullptr, nullptr, wc.hInstance, nullptr);
-    if (self->hwnd) ShowWindow(self->hwnd, SW_SHOWNORMAL);
+    // M8: --window-noactivate: ventana minimizada sin activar (no roba el foco); la cadena de intercambio y Present son las mismas
+    if (self->hwnd) ShowWindow(self->hwnd, g_windowNoActivate ? SW_SHOWMINNOACTIVE : SW_SHOWNORMAL);
     SetEvent(self->ready);
     MSG msg;
     while (!self->stop && GetMessageW(&msg, nullptr, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
@@ -101,9 +109,9 @@ bool D3D12Backend::Init() {
     if (!Hr(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue)), "CreateCommandQueue")) return false;
     if (!Hr(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "CreateFence")) return false;
     fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    for (uint32_t i = 0; i < kFramesInFlight; ++i)
-        if (!Hr(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc[i])), "CreateCommandAllocator")) return false;
-    if (!Hr(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc[0].Get(), nullptr, IID_PPV_ARGS(&cl)), "CreateCommandList")) return false;
+    int a0 = AcquireAllocator();
+    if (a0 < 0) return false;
+    if (!Hr(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocPool[a0].a.Get(), nullptr, IID_PPV_ARGS(&cl)), "CreateCommandList")) return false;
     cl->Close();
     // descriptores
     auto heap = [&](ComPtr<ID3D12DescriptorHeap>& h, D3D12_DESCRIPTOR_HEAP_TYPE t, UINT n, bool visible, const char* what) {
@@ -186,6 +194,7 @@ bool D3D12Backend::Init() {
 // ---- sincronizacion ----
 void D3D12Backend::WaitFence(uint64_t v) {
     if (fence->GetCompletedValue() >= v) return;
+    PERF_ZONE(kZoneFenceWait);
     fence->SetEventOnCompletion(v, fenceEvent);
     WaitForSingleObject(fenceEvent, 20000);
 }
@@ -193,17 +202,44 @@ uint64_t D3D12Backend::Submit() {
     ID3D12CommandList* l[] = {cl.Get()};
     queue->ExecuteCommandLists(1, l);
     queue->Signal(fence.Get(), ++fenceValue);
+    if (curAlloc >= 0) allocPool[curAlloc].fence = fenceValue;
+    drawsSinceKick = 0;
     return fenceValue;
 }
-void D3D12Backend::BeginList() {
+int D3D12Backend::AcquireAllocator() {
+    uint64_t done = fence ? fence->GetCompletedValue() : 0;
+    for (size_t i = 0; i < allocPool.size(); ++i)
+        if ((int)i != curAlloc && allocPool[i].fence <= done) return (int)i;
+    AllocSlot s;
+    if (!Hr(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&s.a)), "CreateCommandAllocator")) return -1;
+    allocPool.push_back(s);
+    return (int)allocPool.size() - 1;
+}
+// newSection=true: empieza una seccion nueva del anillo de subida (espera a que la GPU haya terminado de usarla).
+// newSection=false (Kick): continua en la misma seccion; solo cambia el asignador.
+void D3D12Backend::BeginList(bool newSection) {
     if (clOpen) return;
-    WaitFence(allocFence[frameSlot]);
-    Hr(alloc[frameSlot]->Reset(), "CommandAllocator::Reset");
-    Hr(cl->Reset(alloc[frameSlot].Get(), nullptr), "CommandList::Reset");
+    if (newSection) WaitFence(allocFence[frameSlot]);
+    int a = AcquireAllocator();
+    if (a < 0) return;
+    curAlloc = a;
+    Hr(allocPool[a].a->Reset(), "CommandAllocator::Reset");
+    Hr(cl->Reset(allocPool[a].a.Get(), nullptr), "CommandList::Reset");
     clOpen = true;
-    uploadOffset = 0; uploadBytesFrame = 0;
+    if (newSection) { uploadOffset = 0; uploadBytesFrame = 0; }
     ID3D12DescriptorHeap* heaps[] = {gpuSrvHeap.Get(), gpuSmpHeap.Get()};
     cl->SetDescriptorHeaps(2, heaps);
+}
+unsigned g_kickDraws = 64;   // M8: --kick-draws N (0 = sin envios parciales)
+unsigned g_kickResolveDraws = 32;   // M8: --kick-resolve-draws N (envio tras un resolve si hay >= N draws sin enviar)
+void D3D12Backend::Kick() {
+    if (!clOpen) return;
+    Hr(cl->Close(), "CommandList::Close (kick)");
+    clOpen = false;
+    uint64_t fv = Submit();
+    allocFence[frameSlot] = fv;
+    ++kicks;
+    BeginList(false);
 }
 void D3D12Backend::FlushAndWait() {
     if (!clOpen) return;
@@ -213,7 +249,7 @@ void D3D12Backend::FlushAndWait() {
     allocFence[frameSlot] = fv;
     WaitFence(fv);
     gpuSrvNext = 0;   // toda la GPU esta ociosa: se pueden reutilizar los descriptores
-    gpuSmpNext = 0; samplerTables.clear();
+    gpuSmpNext = 0; samplerTables.clear(); samplerFast.clear();
     BeginList();
 }
 void D3D12Backend::Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
@@ -243,11 +279,14 @@ UploadAlloc D3D12Backend::Upload(uint32_t bytes, uint32_t align) {
 // Sube a la memoria compartida las paginas de [phys, phys+bytes) cuyo contenido cambio desde la ultima subida.
 void D3D12Backend::EnsureMemory(uint32_t phys, uint32_t bytes) {
     if (!bytes) return;
+    PERF_ZONE(kZoneMemUpload);
     phys &= 0x1FFFFFFF;
     uint64_t end = (uint64_t)phys + bytes;
     if (end > kSharedMemBytes) end = kSharedMemBytes;
     uint32_t p0 = phys >> 12, p1 = (uint32_t)((end + 4095) >> 12);
+    FlushResolvesIfOverlap(p0 << 12, (uint32_t)std::min<uint64_t>((uint64_t)p1 << 12, kSharedMemBytes));   // M8: exactitud con resolves diferidos
     uint32_t runStart = 0; bool inRun = false;
+    const uint8_t* whole = PhysHost(p0 << 12, (p1 - p0) * 4096);   // M8: una sola comprobacion para todo el rango
     auto flush = [&](uint32_t from, uint32_t to) {   // paginas [from, to)
         uint32_t n = (to - from) * 4096;
         const uint8_t* src = PhysHost(from << 12, n);
@@ -260,12 +299,10 @@ void D3D12Backend::EnsureMemory(uint32_t phys, uint32_t bytes) {
         pagesUploaded += to - from;
     };
     for (uint32_t pg = p0; pg < p1; ++pg) {
-        const uint8_t* src = PhysHost(pg << 12, 4096);
+        const uint8_t* src = whole ? whole + ((size_t)(pg - p0) << 12) : PhysHost(pg << 12, 4096);
         uint32_t h = 0;
         if (src) {
-            uint64_t x = 1469598103934665603ull;
-            const uint64_t* q = reinterpret_cast<const uint64_t*>(src);
-            for (int i = 0; i < 512; ++i) { x ^= q[i]; x *= 1099511628211ull; }
+            uint64_t x = FastHash(src, 4096);   // M8: hash vectorial (antes FNV de 64 bits en cadena)
             h = (uint32_t)(x ^ (x >> 32)) | 1u;
         }
         bool changed = src && pageHash[pg] != h;
@@ -295,13 +332,18 @@ bool D3D12Backend::PresentFromRgba(const uint8_t* rgba, uint32_t w, uint32_t h) 
 }
 
 void D3D12Backend::OnDraw(const DrawEvent& ev, const ShaderInfo* vs, const ShaderInfo* ps) {
+    PERF_ZONE(kZoneDraw);
     BeginList();
     ++drawSerial;
     if (DoDraw(ev, vs, ps)) { ++drawsOk; ++fDrawsOk; }
     else { ++drawsSkip; ++fDrawsSkip; }
+    if (g_kickDraws && ++drawsSinceKick >= g_kickDraws) Kick();   // M8: la GPU empieza a trabajar mientras el CP sigue
 }
 
 void D3D12Backend::OnSwap(const backend::SwapInfo& s) {
+    PERF_ZONE(kZoneSwapTotal);
+    FlushResolves();                                        // M8 (ya vaciado en el punto de sincronizacion de XE_SWAP)
+    for (auto& kv : resolvedTex) kv.second.valid = false;   // M8: el atajo solo vale dentro del fotograma del resolve
     BeginList();
     // ---- imagen del fotograma ----
     const char* source = "nada";
@@ -316,7 +358,7 @@ void D3D12Backend::OnSwap(const backend::SwapInfo& s) {
         const ResolveImage* ri = nullptr;
         for (auto& r : resolveImages)
             if (r.destBase == s.fbPhys && r.w >= s.w && r.h >= s.h && !r.rgba.empty()) ri = &r;
-        std::vector<uint8_t> rgba;
+        std::vector<uint8_t>& rgba = fbScratch;   // M8: reutilizado (antes 3,6 MB nuevos por fotograma)
         if (ri && ri->x0 == 0 && ri->y0 == 0 && ri->w == s.w) {
             source = "resolve";
             PresentFromRgba(ri->rgba.data(), ri->w, std::min(ri->h, s.h));
@@ -325,7 +367,9 @@ void D3D12Backend::OnSwap(const backend::SwapInfo& s) {
             for (int i = 0; i < 6; ++i) d.fetch[i] = s.fetch[i];
             d.phys = s.fbPhys; d.w = s.w; d.h = s.h;
             std::string info;
-            if (DecodeFrontbuffer(d, rgba, &info)) { source = "frontbuffer"; PresentFromRgba(rgba.data(), s.w, s.h); }
+            bool okfb;
+            { PERF_ZONE(kZoneFbDecode); okfb = DecodeFrontbuffer(d, rgba, &info); }
+            if (okfb) { source = "frontbuffer"; PresentFromRgba(rgba.data(), s.w, s.h); }
             else Note("OMISION presentacion: no se pudo destilar el frontbuffer (" + info + ")");
         }
     }
@@ -353,7 +397,7 @@ void D3D12Backend::OnSwap(const backend::SwapInfo& s) {
     uint64_t fv = Submit();
     allocFence[frameSlot] = fv;
     frameSlot = (frameSlot + 1) % kFramesInFlight;
-    if (swap) { Hr(swap->Present(1, 0), "Present"); ++presentCalls; }
+    if (swap) { PERF_ZONE(kZonePresent); Hr(swap->Present(1, 0), "Present"); ++presentCalls; }
     ++framesPresented;
     CheckRemoved();
     long long nonblack = -1; unsigned long long hash = 0;
@@ -366,8 +410,8 @@ void D3D12Backend::OnSwap(const backend::SwapInfo& s) {
             nonblack = (long long)st.nonblack; hash = st.hash;
             if (dump) {
                 char name[64];
-                std::snprintf(name, sizeof(name), "\\userdata\\frames\\d3d_%05llu.png", (unsigned long long)s.frame);
-                std::string path = GetPaths().runtimeDir + name;
+                std::snprintf(name, sizeof(name), "\\d3d_%05llu.png", (unsigned long long)s.frame);
+                std::string path = rt::gpu::FramesDir() + name;
                 bool ok = WritePngRGBA(path, kW, kH, (const uint8_t*)p, kW * 4);
                 ImportLog::Get().Printf("D3D dump frame=%llu -> %s %s fuente=%s nonblack_px=%lld min/max RGB=%u-%u,%u-%u,%u-%u", (unsigned long long)s.frame, path.c_str(),
                                         ok ? "OK" : "FALLO", source, nonblack, st.minR, st.maxR, st.minG, st.maxG, st.minB, st.maxB);
@@ -382,11 +426,27 @@ void D3D12Backend::OnSwap(const backend::SwapInfo& s) {
                   (unsigned long long)fPsoFail, (unsigned long long)fResolve, (unsigned long long)fTexFail, nonblack, hash, (unsigned long long)fHrFail,
                   (unsigned long long)removed, source);
     GpuLog(b);
+    if (perf::g_enabled) {
+        static uint64_t lastUp = 0, lastHit = 0, lastMiss = 0, lastSc = 0;
+        std::snprintf(b, sizeof(b), "M8 frame=%llu resolves=%zu tex_calls=%llu tex_solapa_resolve=%llu tex_exacta=%llu subidas=%llu memo_hit=%llu memo_miss=%llu atajo=%llu", (unsigned long long)s.frame, frameResolves.size(),
+                      (unsigned long long)fTexCalls, (unsigned long long)fTexOverlap, (unsigned long long)fTexExact, (unsigned long long)(texUploads - lastUp),
+                      (unsigned long long)(texMemoHits - lastHit), (unsigned long long)(texMemoMiss - lastMiss), (unsigned long long)(resolveShortcutHits - lastSc));
+        lastUp = texUploads; lastHit = texMemoHits; lastMiss = texMemoMiss; lastSc = resolveShortcutHits;
+        GpuLog(b);
+    }
+    texMemo.clear();
+    frameResolves.clear(); fTexCalls = fTexOverlap = fTexExact = 0;
     fDrawsOk = fDrawsSkip = fShaderFail = fPsoFail = fResolve = fHrFail = fTexFail = 0;
 }
 
 void D3D12Backend::Shutdown() {
     if (!dev) return;
+    FlushResolves();
+    if (wrThread.joinable()) { { std::lock_guard<std::mutex> g(wrMu); wrStop = true; } wrCv.notify_all(); wrThread.join(); }
+    ImportLog::Get().Printf("M8 envios parciales (kick)=%llu asignadores=%zu", (unsigned long long)kicks, allocPool.size());
+    ImportLog::Get().Printf("M8 resolves: escritos=%llu omitidos_por_cubiertos=%llu vaciados_por_lectura=%llu atajo_gpu=%llu subcopias=%llu",
+                            (unsigned long long)resolveWritten.load(), (unsigned long long)resolveDeadSkipped.load(), (unsigned long long)resolveFlushByRead,
+                            (unsigned long long)resolveShortcutHits, (unsigned long long)resolveSubCopies);
     if (fence) WaitFence(fenceValue);
     ImportLog::Get().Printf("D3D12 resumen: frames=%llu present=%llu draws_ok=%llu draws_skip=%llu shader_fail=%llu pso_fail=%llu resolve=%llu tex_fail=%llu hr_fail=%llu removed=%llu",
                             (unsigned long long)framesPresented, (unsigned long long)presentCalls, (unsigned long long)drawsOk, (unsigned long long)drawsSkip,
@@ -401,6 +461,60 @@ void D3D12Backend::Shutdown() {
 }
 
 static D3D12Backend* g_backend = nullptr;
+
+// ---- M8: grupo de hilos para repartir filas (escrituras disjuntas en memoria guest) ----
+namespace {
+struct RowPool {
+    std::vector<std::thread> th;
+    std::mutex mu;
+    std::condition_variable cv, done;
+    const std::function<bool(uint32_t, uint32_t)>* fn = nullptr;
+    uint32_t rows = 0, chunk = 0, nChunks = 0;
+    std::atomic<uint32_t> next{0}, finished{0};
+    std::atomic<bool> fail{false};
+    uint64_t gen = 0;
+    bool stop = false;
+    void Work() {
+        for (;;) {
+            uint32_t c = next.fetch_add(1);
+            if (c >= nChunks) return;
+            uint32_t b = c * chunk, e = std::min(rows, b + chunk);
+            if (!(*fn)(b, e)) fail = true;
+            if (finished.fetch_add(1) + 1 == nChunks) { std::lock_guard<std::mutex> g(mu); done.notify_all(); }
+        }
+    }
+    void Start(unsigned n) {
+        for (unsigned i = 0; i < n; ++i)
+            th.emplace_back([this, i] {
+                char nm[32]; std::snprintf(nm, sizeof(nm), "gpu-rows-%u", i); rt::perf::NameCurrentThread(nm);
+                uint64_t seen = 0;
+                for (;;) {
+                    { std::unique_lock<std::mutex> g(mu); cv.wait(g, [&] { return stop || gen != seen; }); if (stop) return; seen = gen; }
+                    Work();
+                }
+            });
+    }
+    bool Run(uint32_t r, const std::function<bool(uint32_t, uint32_t)>& f) {
+        chunk = 16; rows = r; nChunks = (r + chunk - 1) / chunk; fn = &f;
+        next = 0; finished = 0; fail = false;
+        { std::lock_guard<std::mutex> g(mu); ++gen; }
+        cv.notify_all();
+        Work();
+        std::unique_lock<std::mutex> g(mu);
+        done.wait(g, [&] { return finished.load() >= nChunks; });
+        return !fail;
+    }
+};
+RowPool* g_rowPool = nullptr;
+} // namespace
+
+unsigned g_rowThreads = 6;   // M8: --gpu-row-threads N (0 = sin hilos auxiliares)
+
+bool D3D12Backend::ParallelRows(uint32_t rows, const std::function<bool(uint32_t, uint32_t)>& fn) {
+    if (!g_rowThreads || rows < 64) return fn(0, rows);
+    if (!g_rowPool) { g_rowPool = new RowPool(); g_rowPool->Start(g_rowThreads); }
+    return g_rowPool->Run(rows, fn);
+}
 
 } // namespace rt::gpu::d3d
 

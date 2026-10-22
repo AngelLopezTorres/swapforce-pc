@@ -7,6 +7,11 @@
 #include <wrl/client.h>
 
 #include <atomic>
+#include <functional>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -27,6 +32,10 @@
 #include "xenia/gpu/xenos.h"
 
 namespace rt::gpu::d3d {
+
+extern unsigned g_kickDraws, g_kickResolveDraws;
+extern bool g_asyncResolveWriter;
+extern bool g_resolveSync, g_noResolveShortcut, g_resolveNoDse, g_resolveSlowPath, g_resolveVerify, g_verifyShortcut;
 
 using Microsoft::WRL::ComPtr;
 namespace reg = xe::gpu::reg;
@@ -96,8 +105,15 @@ public:
     ComPtr<ID3D12Fence> fence;
     HANDLE fenceEvent = nullptr;
     uint64_t fenceValue = 0;
-    ComPtr<ID3D12CommandAllocator> alloc[kFramesInFlight];
-    uint64_t allocFence[kFramesInFlight] = {};
+    uint64_t allocFence[kFramesInFlight] = {};   // ultima valla que usa la seccion del anillo de subida de cada fotograma
+    // M8: grupo de asignadores (una lista puede enviarse varias veces por fotograma: Kick)
+    struct AllocSlot { ComPtr<ID3D12CommandAllocator> a; uint64_t fence = 0; };
+    std::vector<AllocSlot> allocPool;
+    int curAlloc = -1;
+    uint32_t drawsSinceKick = 0;
+    uint64_t kicks = 0;
+    int AcquireAllocator();
+    void Kick();                                // M8: envia lo grabado sin esperar y reabre la lista
     ComPtr<ID3D12GraphicsCommandList> cl;
     bool clOpen = false;
     uint32_t frameSlot = 0;
@@ -138,6 +154,9 @@ public:
     DxilBlob gsRect;
     bool gsRectTried = false;
     std::unordered_map<std::string, uint32_t> samplerTables;    // clave de 32 muestreadores -> indice en el heap de muestreadores
+    struct SmpFast { std::string desc; uint32_t base; };
+    std::unordered_multimap<uint64_t, SmpFast> samplerFast;     // M8: indice por hash (se vacia junto con samplerTables)
+    std::unordered_multimap<uint64_t, std::pair<std::string, ID3D12PipelineState*>> psoFast;   // M8: indice por hash de psoCache
 
     // render targets
     std::map<uint64_t, HostRT> colorRTs, depthRTs;
@@ -164,7 +183,7 @@ public:
     void CheckRemoved();
     void WaitFence(uint64_t v);
     uint64_t Submit();
-    void BeginList();
+    void BeginList(bool newSection = true);
     void FlushAndWait();                        // cierra, ejecuta y espera; reabre la lista
     void Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to);
     void SetFrameRTState(D3D12_RESOURCE_STATES s);
@@ -189,10 +208,82 @@ public:
     HostRT* GetColorRT(uint32_t base, uint32_t pitch, uint32_t fmt, uint32_t needH);
     HostRT* GetDepthRT(uint32_t base, uint32_t pitch, uint32_t fmt, uint32_t needH);
     bool DoResolve(const DrawEvent& ev);
+    // M8: resolve diferido y atajo GPU
+    struct PendingResolve {
+        uint32_t bpp = 4, bppLog2 = 2, rowPitch = 0, w = 0, h = 0;
+        int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+        uint32_t destBase = 0, endian = 0, dpAligned = 0, sfmt = 0, dfmt = 0;
+        bool swapRB = false, ok32 = false;
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+        int64_t lo = 0, hi = 0;
+        uint8_t* mem = nullptr;
+        uint64_t poolOffset = 0;
+        uint64_t fence = 0;     // valla tras la que la copia de lectura esta completa
+        bool dead = false;      // cubierto por un resolve posterior (no se escribe)
+    };
+    struct ResolvedTex {
+        HostTexture ht;
+        D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COPY_DEST;
+        uint32_t srvMap = 0xFFFFFFFF;
+        bool valid = false, swapRB = false;
+        uint32_t destBase = 0, w = 0, h = 0, dfmt = 0, endian = 0, dpAligned = 0, lo = 0, hi = 0;
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+        uint64_t serial = 0;      // incrementa con cada copia del resolve
+        uint64_t srcSerial = 0;   // derivada: serial de la copia de origen ya copiada
+        bool derived = false;
+    };
+    uint64_t resolveCopySerial = 0, resolveSubCopies = 0;
+    std::vector<PendingResolve> pendingResolves;   // modo sincronico
+    // M8: hilo escritor (modo asincrono)
+    std::deque<PendingResolve> wrQueue;
+    std::mutex wrMu;
+    std::condition_variable wrCv, wrDone;
+    std::thread wrThread;
+    bool wrBusy = false, wrStop = false;
+    uint64_t wrMaxFence = 0;
+    const uint8_t* resolvePoolCpu = nullptr;
+    void EnqueueResolve(PendingResolve pr);
+    ComPtr<ID3D12Resource> resolvePool;
+    uint64_t resolvePoolBytes = 0, resolvePoolOffset = 0;
+    std::unordered_map<uint64_t, ResolvedTex> resolvedTex;
+    std::atomic<uint64_t> resolveDeadSkipped{0}, resolveWritten{0};
+    uint64_t resolveFlushByRead = 0, resolveShortcutHits = 0;
+    void WriteResolve(const PendingResolve& pr, const uint8_t* srcp);
+    bool EnsureResolvePool(uint64_t need);
+    void FlushResolves();
+    void FlushResolvesIfOverlap(uint32_t lo, uint32_t hi);
+    void InvalidateResolvedTex(uint32_t lo, uint32_t hi);
+    void RecordResolvedTex(const PendingResolve& pr, const D3D12_TEXTURE_COPY_LOCATION& srcLoc, const D3D12_BOX& box);
+    HostTexture* LookupResolvedTex(uint32_t base, uint32_t width, uint32_t height, uint32_t fmt, uint32_t endian, uint32_t pitchAligned, uint32_t swizzle);
+    void SyncPoint() override { FlushResolves(); }
+    bool shortcutVerifyActive = false;
+    void VerifyShortcut(HostTexture* gpuTex, HostTexture* cpuTex, uint32_t base, uint32_t w, uint32_t h, uint32_t fmt);
+    // reparto de filas entre hilos auxiliares (escrituras disjuntas); devuelve false si algun tramo fallo
+    bool ParallelRows(uint32_t rows, const std::function<bool(uint32_t, uint32_t)>& fn);
     void ClearRT(HostRT* rt, const float* color);
 
     // ---- d3d12_tex.cpp ----
     HostTexture* GetTexture(uint32_t fetchIdx, bool vertexStage);
+    std::vector<uint8_t> texScratch;            // M8: bufer de destilado reutilizado
+    std::vector<uint8_t> resolveRow;
+    std::vector<uint8_t> fbScratch;            // M8: fila convertida del resolve
+    struct FrameResolve { uint32_t lo, hi, destBase, w, h, fmt, endian, x0, y0; };
+    std::vector<FrameResolve> frameResolves;
+    // M8: memo del hash de datos de textura dentro de un fotograma (clave de textura -> rango y hash). Se vacia en cada XE_SWAP
+    // y se invalidan las entradas que solapan cualquier resolve (escritura de la GPU en memoria guest).
+    struct TexMemo { uint32_t lo, hi; uint64_t hash; };
+    std::unordered_map<uint64_t, TexMemo> texMemo;
+    uint64_t texMemoHits = 0, texMemoMiss = 0;
+    void MemWritten(uint32_t a, uint32_t n) override {
+        uint32_t lo = a & 0x1FFFFFFF;
+        InvalidateTexMemo(lo, lo + n);
+        InvalidateResolvedTex(lo, lo + n);
+    }
+    void InvalidateTexMemo(uint32_t lo, uint32_t hi) {
+        for (auto it = texMemo.begin(); it != texMemo.end();) { if (it->second.lo < hi && it->second.hi > lo) it = texMemo.erase(it); else ++it; }
+    }
+    bool SeqLog() const { static long f = std::getenv("M8_SEQ_FRAME") ? std::atol(std::getenv("M8_SEQ_FRAME")) : -1; return f >= 0 && (long)rt::gpu::FrameCount() + 1 == f; }    // M8 (diagnostico): resolves del fotograma en curso
+    uint64_t fTexOverlap = 0, fTexExact = 0, fTexCalls = 0, fResolveDistinctAfter = 0;
     D3D12_SAMPLER_DESC SamplerFromFetch(uint32_t fetchIdx);
 };
 

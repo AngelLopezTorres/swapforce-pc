@@ -37,6 +37,7 @@ public:
     static GuestThread* ById(uint32_t id);   // hilo guest por id (el que devuelve ExCreateThread); nullptr si no existe
     // Diagnostico: para cada hilo guest vivo, registra RIP host y marcos candidatos (funciones guest).
     static void DumpAllThreads();
+    static void DumpWaitStates();       // M8: sin suspender hilos (estado de espera, ultimo import, lr)
     PPCContext& Ctx() { return *ctx_; }
 
     HANDLE HostHandle() const { return host_; }

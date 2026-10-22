@@ -1,6 +1,7 @@
 #include "guest_thread.h"
 
 #include <algorithm>
+#include <cwchar>
 #include <atomic>
 #include <mutex>
 #include <vector>
@@ -195,6 +196,11 @@ DWORD WINAPI GuestThreadProc(void* p) {
 
 void GuestThread::Run() {
     g_current = this;
+    {
+        wchar_t w[96];
+        std::swprintf(w, 96, L"g%u:%S", id, params_.name ? params_.name : "guest");
+        SetThreadDescription(GetCurrentThread(), w);
+    }
     traceRing = &g_traceRing;
     if (const char* w = std::getenv("SWAPFORCE_WATCH_F30")) {
         if ((uint32_t)std::strtoul(w, nullptr, 0) == id) {
@@ -276,6 +282,16 @@ static bool GuestFuncNoAlloc(uintptr_t host, uint32_t* guest, size_t* off) {
     if (host - it->first > 0x40000) return false;
     *guest = it->second; *off = host - it->first;
     return true;
+}
+
+void GuestThread::DumpWaitStates() {
+    std::vector<GuestThread*> ts;
+    { std::lock_guard<std::mutex> g(g_regMu); ts = g_registry; }
+    for (GuestThread* t : ts) {
+        if (t->finished_) continue;
+        ImportLog::Get().Printf("  WAITSTATE tid=%u name=\"%s\" wait=%u:%08X:type%u:n%u last_import=%s lr=%08X", t->id, t->dynName[0] ? t->dynName : t->params_.name,
+                                t->waitKind, t->waitHandle, t->waitType, t->waitCount, t->lastImport ? t->lastImport : "", (uint32_t)t->ctx_->lr);
+    }
 }
 
 void GuestThread::DumpAllThreads() {

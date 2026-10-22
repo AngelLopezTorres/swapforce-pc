@@ -18,10 +18,12 @@
 #include "gpu.h"
 #include "d3d12_backend.h"
 #include "ucode_hlsl.h"
+#include "perf.h"
 
-namespace rt::gpu { int Pm4SelfTest(); }
+namespace rt::gpu { int Pm4SelfTest(); extern bool g_fbSlowPath, g_fbVerify; }
+namespace rt::gpu::d3d { extern bool g_texSlowPath, g_texVerify, g_resolveSlowPath, g_resolveVerify, g_texMemoOff, g_resolveSync, g_noResolveShortcut, g_resolveNoDse, g_verifyShortcut; extern unsigned g_rowThreads, g_kickDraws, g_kickResolveDraws; extern bool g_windowNoActivate; extern bool g_asyncResolveWriter; }
 int RunCpuSelfTest(uint64_t n, uint64_t seed);   // selftest\cpu_selftest.cpp
-namespace rt { extern bool g_noAudio; void AudioSummary(); void BinkProbeReport(); }
+namespace rt { extern bool g_binkProbeOn; extern bool g_importSerialize; extern bool g_noAudio; void AudioSummary(); void BinkProbeReport(); }
 
 PPC_EXTERN_FUNC(_xstart);
 PPC_EXTERN_FUNC(__imp__NtCreateFile);
@@ -93,6 +95,7 @@ int main(int argc, char** argv) {
     auto& log = rt::ImportLog::Get();
     std::string logPath = "runtime.log";
     bool selftest = false, iotest = false;
+    std::string perfOut;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--max-imports") && i + 1 < argc) log.Config().maxImports = std::strtoull(argv[++i], nullptr, 0);
         else if (!std::strcmp(argv[i], "--log") && i + 1 < argc) logPath = argv[++i];
@@ -102,11 +105,33 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--gpu-regdump")) rt::gpu::Cfg().regDump = true;
         else if (!std::strcmp(argv[i], "--gpu-log") && i + 1 < argc) rt::gpu::Cfg().logPath = argv[++i];
         else if (!std::strcmp(argv[i], "--gpu-statelog")) rt::gpu::Cfg().stateLog = true;
+        else if (!std::strcmp(argv[i], "--gpu-hist")) rt::gpu::Cfg().hist = true;
+        else if (!std::strcmp(argv[i], "--frames-dir") && i + 1 < argc) rt::gpu::Cfg().framesDir = argv[++i];
+        else if (!std::strcmp(argv[i], "--shader-scan")) rt::gpu::Cfg().shaderScan = true;
+        else if (!std::strcmp(argv[i], "--window-noactivate")) rt::gpu::d3d::g_windowNoActivate = true;
         else if (!std::strcmp(argv[i], "--dump-fb")) rt::gpu::Cfg().dumpFb = true;
         else if (!std::strcmp(argv[i], "--no-d3d")) rt::gpu::Cfg().noD3d = true;
         else if (!std::strcmp(argv[i], "--no-audio")) rt::g_noAudio = true;
-        else if (!std::strcmp(argv[i], "--bink-trace")) rt::gpu::Cfg().binkTrace = true;
+        else if (!std::strcmp(argv[i], "--bink-trace")) { rt::gpu::Cfg().binkTrace = true; rt::g_binkProbeOn = true; }
         else if (!std::strcmp(argv[i], "--headless")) rt::gpu::Cfg().headless = true;
+        else if (!std::strcmp(argv[i], "--tex-slow-path")) rt::gpu::d3d::g_texSlowPath = true;
+        else if (!std::strcmp(argv[i], "--tex-verify")) rt::gpu::d3d::g_texVerify = true;
+        else if (!std::strcmp(argv[i], "--resolve-slow-path")) rt::gpu::d3d::g_resolveSlowPath = true;
+        else if (!std::strcmp(argv[i], "--resolve-verify")) rt::gpu::d3d::g_resolveVerify = true;
+        else if (!std::strcmp(argv[i], "--no-tex-memo")) rt::gpu::d3d::g_texMemoOff = true;
+        else if (!std::strcmp(argv[i], "--resolve-sync")) rt::gpu::d3d::g_resolveSync = true;
+        else if (!std::strcmp(argv[i], "--fb-slow-path")) rt::gpu::g_fbSlowPath = true;
+        else if (!std::strcmp(argv[i], "--sync-resolve-writer")) rt::gpu::d3d::g_asyncResolveWriter = false;
+        else if (!std::strcmp(argv[i], "--kick-draws") && i + 1 < argc) rt::gpu::d3d::g_kickDraws = (unsigned)std::strtoul(argv[++i], nullptr, 0);
+        else if (!std::strcmp(argv[i], "--kick-resolve-draws") && i + 1 < argc) rt::gpu::d3d::g_kickResolveDraws = (unsigned)std::strtoul(argv[++i], nullptr, 0);
+        else if (!std::strcmp(argv[i], "--fb-verify")) rt::gpu::g_fbVerify = true;
+        else if (!std::strcmp(argv[i], "--verify-shortcut")) rt::gpu::d3d::g_verifyShortcut = true;
+        else if (!std::strcmp(argv[i], "--no-resolve-shortcut")) rt::gpu::d3d::g_noResolveShortcut = true;
+        else if (!std::strcmp(argv[i], "--no-resolve-dse")) rt::gpu::d3d::g_resolveNoDse = true;
+        else if (!std::strcmp(argv[i], "--gpu-row-threads") && i + 1 < argc) rt::gpu::d3d::g_rowThreads = (unsigned)std::strtoul(argv[++i], nullptr, 0);
+        else if (!std::strcmp(argv[i], "--perf-nosample")) rt::perf::g_sample = false;
+        else if (!std::strcmp(argv[i], "--import-serialize")) rt::g_importSerialize = true;
+        else if (!std::strcmp(argv[i], "--perf")) perfOut = (i + 1 < argc && argv[i + 1][0] != '-') ? argv[++i] : "perf_report.txt";
         else if (!std::strcmp(argv[i], "--warp")) rt::gpu::Cfg().warp = true;
         else if (!std::strcmp(argv[i], "--d3d-clear-test")) rt::gpu::Cfg().clearTest = true;
         else if (!std::strcmp(argv[i], "--d3d-stats")) rt::gpu::Cfg().d3dStats = true;
@@ -203,21 +228,24 @@ int main(int argc, char** argv) {
         if (!rt::gpu::d3d::Start(o)) log.Printf("D3D12 no disponible: se continua sin dibujo");
     }
     rt::gpu::Start();
+    if (!perfOut.empty()) rt::perf::Start(perfOut.c_str());
     log.Printf("start _xstart 0x82F422E8");
     th->Start();
     th->Resume();
     if (!th->Join(timeoutSec * 1000)) {
         log.Printf("TIMEOUT %us: el hilo principal sigue en ejecucion; ultimo import=%s", timeoutSec, rt::ImportLog::LastImport());
+        rt::perf::Stop();
         rt::GuestThread::DumpAllThreads();
         rt::BinkProbeReport();
         rt::AudioSummary();
-        rt::gpu::ScanShaderContainers("fin (timeout)");
+        if (rt::gpu::Cfg().shaderScan) rt::gpu::ScanShaderContainers("fin (timeout)");
         rt::gpu::Stop();
         rt::gpu::Summary();
         log.Summary();
         std::fflush(nullptr);
         ExitProcess(4);
     }
+    rt::perf::Stop();
     rt::gpu::Stop();
     rt::gpu::Summary();
     log.Summary();
