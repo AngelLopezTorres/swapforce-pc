@@ -1,7 +1,7 @@
 #!/bin/sh
 # M8: medida estandar. Uso: measure.sh <etiqueta> [segundos=60] [opciones extra]
 # Ejecuta desde runtime\: build\SwapForceRT.exe --perf perf_<etiqueta>.txt --timeout N <extra> > run_<etiqueta>.out
-cd /c/Users/Pastrones/SwapForce-PC/runtime || exit 1
+cd $(cd "$(dirname "$0")/../../.." && pwd)/runtime || exit 1
 tag=$1; secs=${2:-60}; shift; shift
 timeout $((secs + 60)) build/SwapForceRT.exe --perf m8/perf_$tag.txt --timeout $secs --headless "$@" > m8/run_$tag.out 2>&1
 echo "EXIT=$?"
