@@ -203,6 +203,7 @@ GUEST_IMPORT_IMPL(XMACreateContext) {
     uint32_t context = rt::audio::CreateXmaContext();
     P32(base, ctx.r3.u32, context);
     if (!context) { SetRet(ctx, 0xC0000017); return; } // STATUS_NO_MEMORY
+    rt::audio::StartXmaWorker();
     SetRet(ctx, ST_SUCCESS);
 }
 

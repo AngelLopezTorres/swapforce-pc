@@ -50,5 +50,9 @@ uint32_t ReadXmaRegister(uint32_t guestAddress);
 XmaDecodeBoundaryResult SubmitXmaDecode(uint32_t contextGuestAddress);
 uint64_t XmaDecodeRequestCount();
 bool XmaDecoderBackendAvailable();
+uint32_t SimulateXmaStep();
+uint64_t XmaSimulatedPacketCount();
+void StartXmaWorker();
+void StopXmaWorker();
 
 } // namespace rt::audio

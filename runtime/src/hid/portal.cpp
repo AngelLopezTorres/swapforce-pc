@@ -5,6 +5,7 @@
 #include <winusb.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdio>
 #include <memory>
@@ -12,6 +13,7 @@
 #include <vector>
 
 #include "guest_abi.h"
+#include "import_log.h"
 
 namespace rt::hid {
 namespace {
@@ -225,12 +227,42 @@ bool PortalProbeAccepted(const PortalProbeResult& result) {
            result.readAttempted && (result.readSucceeded || result.readTimedOut);
 }
 
-void XamInputNonControllerGetRaw(PPCContext& ctx, uint8_t*) {
+static void LogRawCall(const char* name, PPCContext& ctx, uint8_t* base) {
+    static std::atomic<uint64_t> getCalls{0}, setCalls{0};
+    uint64_t call = (name[0] == 'G' ? getCalls : setCalls).fetch_add(1) + 1;
+    // El juego sondea GetRaw miles de veces por minuto. Conservar las primeras
+    // muestras y una por cada 1024 llamadas limita el volumen de la traza.
+    if (call > 8 && (call & 1023) != 0) return;
+    const uint32_t args[] = {ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32,
+                             ctx.r7.u32, ctx.r8.u32, ctx.r9.u32, ctx.r10.u32};
+    ImportLog::Get().Printf("PORTAL %s call=%llu r3..r10=%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X",
+                            name, static_cast<unsigned long long>(call), args[0], args[1], args[2], args[3],
+                            args[4], args[5], args[6], args[7]);
+    for (unsigned i = 0; i < 8; ++i) {
+        if (args[i] < 0x10000u || args[i] > 0xFFFFFFF0u) continue;
+        const uint8_t* p = base + args[i];
+        MEMORY_BASIC_INFORMATION region{};
+        if (!VirtualQuery(p, &region, sizeof(region)) || region.State != MEM_COMMIT ||
+            (region.Protect & (PAGE_GUARD | PAGE_NOACCESS))) continue;
+        uintptr_t available = reinterpret_cast<uintptr_t>(region.BaseAddress) +
+                              region.RegionSize - reinterpret_cast<uintptr_t>(p);
+        unsigned n = static_cast<unsigned>(std::min<uintptr_t>(available, 16));
+        char hex[33]{};
+        for (unsigned j = 0; j < n; ++j)
+            std::snprintf(hex + j * 2, sizeof(hex) - j * 2, "%02X", p[j]);
+        ImportLog::Get().Printf("PORTAL %s r%u=%08X bytes[%u]=%s", name, i + 3,
+                                args[i], n, hex);
+    }
+}
+
+void XamInputNonControllerGetRaw(PPCContext& ctx, uint8_t* base) {
+    LogRawCall("GetRaw", ctx, base);
     // ABI y formato del buffer guest pendientes de documentar; no se adivinan punteros guest.
     SetRet(ctx, 0xC00000BB); // STATUS_NOT_SUPPORTED
 }
 
-void XamInputNonControllerSetRaw(PPCContext& ctx, uint8_t*) {
+void XamInputNonControllerSetRaw(PPCContext& ctx, uint8_t* base) {
+    LogRawCall("SetRaw", ctx, base);
     // Escrituras USB desde el juego quedan deshabilitadas; el ABI del export es [NV].
     SetRet(ctx, 0xC00000BB); // STATUS_NOT_SUPPORTED
 }

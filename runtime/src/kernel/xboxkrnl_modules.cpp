@@ -5,6 +5,7 @@
 #include <unordered_map>
 
 #include "guest_abi.h"
+#include "guest_heap.h"
 #include "guest_memory.h"
 #include "import_log.h"
 #include "kobject.h"
@@ -82,8 +83,10 @@ GUEST_IMPORT_IMPL(XexLoadImage) {
     std::string name = GuestCString(base, ctx.r3.u32);
     ImportLog::Get().Printf("  XexLoadImage nombre=\"%s\"", name.c_str());
     if (!IsSystemModule(name)) { SetRet(ctx, 0xC0000135); return; } // STATUS_DLL_NOT_FOUND
-    auto o = std::make_shared<KObject>(KType::Other);
-    uint32_t h = HandleTable::Get().Add(o);
+    // Xenia devuelve la direccion guest de X_LDR_DATA_TABLE_ENTRY. El juego
+    // lee dll_base en +0x18 despues de XexGetProcedureAddress.
+    uint32_t h = SystemHeap().Alloc(0x100);
+    if (!h) { SetRet(ctx, 0xC0000017); return; }
     TrackModule(h, name);
     if (ctx.r6.u32) P32(base, ctx.r6.u32, h);
     SetRet(ctx, ST_SUCCESS);
@@ -95,8 +98,8 @@ GUEST_IMPORT_IMPL(XexGetModuleHandle) {
     std::string name = GuestCString(base, ctx.r3.u32);
     ImportLog::Get().Printf("  XexGetModuleHandle nombre=\"%s\"", name.c_str());
     if (!IsSystemModule(name)) { SetRet(ctx, 0xC0000135); return; }
-    auto o = std::make_shared<KObject>(KType::Other);
-    uint32_t h = HandleTable::Get().Add(o);
+    uint32_t h = SystemHeap().Alloc(0x100);
+    if (!h) { SetRet(ctx, 0xC0000017); return; }
     TrackModule(h, name);
     if (ctx.r4.u32) P32(base, ctx.r4.u32, h);
     SetRet(ctx, ST_SUCCESS);
@@ -124,7 +127,7 @@ GUEST_IMPORT_IMPL(XexGetProcedureAddress) {
 GUEST_IMPORT_IMPL(XexUnloadImage) {
     ImportScope sc("XexUnloadImage", ctx, base);
     ForgetModule(ctx.r3.u32);
-    HandleTable::Get().Close(ctx.r3.u32);
+    SystemHeap().Free(ctx.r3.u32);
     SetRet(ctx, ST_SUCCESS);
 }
 

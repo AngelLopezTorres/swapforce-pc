@@ -127,6 +127,7 @@ static bool XmaSelfTest(uint8_t* base) {
         std::printf("xma-selftest create=%08X context=%08X -> FALLO\n", createStatus, first);
         return false;
     }
+    rt::audio::StopXmaWorker(); // El paso sintetico de este selftest se ejecuta de forma determinista.
     uint32_t contextArray = rt::audio::XmaContextArrayGuestAddress();
 
     bool layout = sizeof(rt::audio::XmaContextData) == 64 && first == contextArray &&
@@ -150,6 +151,23 @@ static bool XmaSelfTest(uint8_t* base) {
     bool decoderBoundary = boundary == rt::audio::XmaDecodeBoundaryResult::BackendUnavailable &&
                            !rt::audio::XmaDecoderBackendAvailable() &&
                            rt::audio::XmaDecodeRequestCount() == requestsBefore + 1;
+
+    // El sumidero sintetico consume un paquete y hace visible el avance del
+    // contexto sin presentar su salida silenciosa como audio decodificado.
+    constexpr uint32_t outputPhysical = 0x00100000;
+    std::memset(base + 0xA0000000u + outputPhysical, 0x7F, 1024);
+    rt::P32(base, first, 1u | (1u << 20) | (4u << 22));
+    rt::P32(base, first + 4, 0x80000000u);
+    rt::P32(base, first + 16, 0);
+    rt::P32(base, first + 28, outputPhysical);
+    uint64_t packetsBefore = rt::audio::XmaSimulatedPacketCount();
+    bool silence = rt::audio::SimulateXmaStep() == 1 &&
+                   rt::audio::XmaSimulatedPacketCount() == packetsBefore + 1 &&
+                   (rt::G32(base, first) & (1u << 20)) == 0 &&
+                   rt::G32(base, first + 8) == rt::audio::kXmaPacketBytes * 8;
+    for (uint32_t j = 0; j < 1024; ++j) silence = silence && base[0xA0000000u + outputPhysical + j] == 0;
+    rt::audio::SimulateXmaStep();
+    silence = silence && (rt::G32(base, first + 4) & 0x80000000u) == 0;
 
     ctx = PPCContext{};
     ctx.r3.u64 = scratch + 4;
@@ -184,10 +202,11 @@ static bool XmaSelfTest(uint8_t* base) {
     for (uint32_t i = 0; i < count; ++i) released = rt::audio::ReleaseXmaContext(allocated[i]) && released;
     exhaustion = exhaustion && count == rt::audio::kXmaContextCount;
 
-    bool ok = createStatus == 0 && first != 0 && layout && registers && decoderBoundary && allocation && released && exhaustion;
-    std::printf("xma-selftest create=%08X context=%08X array=%08X layout=%s registers=%s decode-boundary=%s requests=%llu release=%s capacity=%u/%u -> %s\n",
+    bool ok = createStatus == 0 && first != 0 && layout && registers && decoderBoundary && silence && allocation && released && exhaustion;
+    std::printf("xma-selftest create=%08X context=%08X array=%08X layout=%s registers=%s decode-boundary=%s silence=%s packets=%llu requests=%llu release=%s capacity=%u/%u -> %s\n",
                 createStatus, first, contextArray, layout ? "OK" : "FAIL", registers ? "OK" : "FAIL",
-                decoderBoundary ? "BACKEND_UNAVAILABLE" : "FAIL",
+                decoderBoundary ? "BACKEND_UNAVAILABLE" : "FAIL", silence ? "OK" : "FAIL",
+                static_cast<unsigned long long>(rt::audio::XmaSimulatedPacketCount()),
                 static_cast<unsigned long long>(rt::audio::XmaDecodeRequestCount()),
                 released ? "OK" : "FAIL", count, rt::audio::kXmaContextCount, ok ? "OK" : "FALLO");
     return ok;
@@ -384,14 +403,18 @@ int main(int argc, char** argv) {
         rt::GuestThread::DumpAllThreads();
         rt::BinkProbeReport();
         rt::AudioSummary();
+        log.Printf("XMA resumen: paquetes_sinteticos=%llu backend=sin_decodificador",
+                   static_cast<unsigned long long>(rt::audio::XmaSimulatedPacketCount()));
         rt::gpu::ScanShaderContainers("fin (timeout)");
         rt::gpu::Stop();
         rt::gpu::Summary();
+        rt::audio::StopXmaWorker();
         log.Summary();
         std::fflush(nullptr);
         ExitProcess(4);
     }
     rt::gpu::Stop();
+    rt::audio::StopXmaWorker();
     rt::gpu::Summary();
     log.Summary();
     return th->ExitCode();

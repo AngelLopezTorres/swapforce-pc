@@ -63,7 +63,10 @@ set_target_properties(SwapForceRT PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${SWAPFOR
 
 # DXC (H2): compilador HLSL -> DXIL junto al ejecutable (de la copia de XenosRecomp, MIT/NCSA)
 # Orden: DXC descargado por setup.ps1 (tools/dxc), si no, la copia de XenosRecomp del arbol de desarrollo.
-if(EXISTS "${SWAPFORCE_ROOT}/tools/dxc/bin/x64/dxcompiler.dll")
+set(SWAPFORCE_DXC_BIN "" CACHE PATH "Directorio con dxcompiler.dll y dxil.dll ya disponibles")
+if(SWAPFORCE_DXC_BIN)
+  set(DXC_BIN "${SWAPFORCE_DXC_BIN}")
+elseif(EXISTS "${SWAPFORCE_ROOT}/tools/dxc/bin/x64/dxcompiler.dll")
   set(DXC_BIN "${SWAPFORCE_ROOT}/tools/dxc/bin/x64")
 else()
   set(DXC_BIN "${SWAPFORCE_ROOT}/tools/XenosRecomp/thirdparty/dxc-bin/bin/x64")
