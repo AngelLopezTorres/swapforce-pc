@@ -1,13 +1,13 @@
 # Contexto del proyecto (traspaso entre equipos) — actualizado 2026-10-12
 
-Proyecto: port nativo a PC de Skylanders Swap Force (Xbox 360) por recompilación estática (XenonRecomp + runtime propio en `runtime\` + backend D3D12). Requiere la ISO propia del usuario; el repositorio NO contiene contenido del juego (ver `LEGAL_RESUMEN.md`). Repositorio privado.
+Proyecto: port nativo a PC de Skylanders Swap Force (Xbox 360) por recompilación estática (XenonRecomp + runtime propio en `runtime\` + backend D3D12). Requiere la ISO propia del usuario; el repositorio NO contiene contenido del juego (ver `LEGAL_RESUMEN.md`). Repositorio PUBLICO desde 2026-10-12 (decision del usuario); sin contenido del juego.
 
 ## Reglas de trabajo (organización FeeX)
 Formal, escueto, metódico; solo datos objetivos y documentables, sin opiniones; citar normativa/documentación oficial; no inventar: preguntar lo necesario; marcar [NV] lo no verificado; no afirmar que algo funciona sin ejecutar el comando; distinguir "compila" de "se ha ejecutado".
 
 ## Decisiones del usuario
 - Objetivo: juego fiel al original, nativo en PC, con escalado de resolución interna 2K (x2) y luego 4K (x3). Mods: más adelante. Unity/Bevy descartados (cambiarían el comportamiento).
-- Quiere subirlo a GitHub para que otros lo jueguen (modelo: herramientas + ISO propia del usuario). Hoy el repo es PRIVADO; la publicación pública depende de asesoría jurídica (`LEGAL_RESUMEN.md`, 13 preguntas abiertas). `LICENSE` es propuesta con `[TITULAR]` sin definir.
+- Repositorio publicado (público) por decisión del usuario para que otros lo jueguen (modelo: herramientas + ISO propia). La asesoría jurídica sigue pendiente (`LEGAL_RESUMEN.md`, 13 preguntas abiertas). `LICENSE` es propuesta con `[TITULAR]` sin definir.
 - Portal of Power: físico (paso directo USB; referencia Xenia Canary `hid/portal`). Modelo exacto: pendiente de preguntar.
 - Aceptado: FFmpeg/libavcodec (LGPL, DLL dinámica) para XMA. Pendiente: capturas de referencia del juego original y umbral PSNR (propuesta 40 dB).
 - Método usado: planificar con agente Opus (`Plan`, model opus), ejecutar con agente Sonnet; planes en `PLAN_RUNTIME.md`, `PLAN_VIDEO.md`, `PLAN_GPU.md`, `PLAN_FIDELIDAD.md`. Detalle de resultados en `PROGRESS.md` (apartados Runtime, Vídeo, GPU, Fidelidad).

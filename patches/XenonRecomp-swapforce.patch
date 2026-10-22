@@ -247,7 +247,7 @@ index d08371e..40313be 100644
      f.write(out.data(), out.size());
  
 diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
-index fa91527..4553553 100644
+index fa91527..a061aa8 100644
 --- a/XenonRecomp/recompiler.cpp
 +++ b/XenonRecomp/recompiler.cpp
 @@ -1,5 +1,6 @@
@@ -370,7 +370,7 @@ index fa91527..4553553 100644
 +        break;
 +
 +    case PPC_INST_FRSQRTE:
-+        // Power ISA v2.07B 4.6.7: estimacion de 1/sqrt(FRB) con error relativo <= 1/32. Se calcula en doble precision (el redondeo a
++        // Power ISA v2.07B 4.6.6: estimacion de 1/sqrt(FRB) con error relativo <= 1/32. Se calcula en doble precision (el redondeo a
 +        // float desbordaba a infinito para |x| < ~8.6e-78 y perdia precision para |x| > ~1e77).
 +        printSetFlushMode(false);
 +        println("\t{}.f64 = 1.0 / sqrt({}.f64);", f(insn.operands[0]), f(insn.operands[1]));
@@ -755,3 +755,77 @@ index fa91527..4553553 100644
          default:
              println("\t__builtin_debugtrap();");
              break;
+diff --git a/XenonUtils/disasm.h b/XenonUtils/disasm.h
+index 195bc85..4e58a03 100644
+--- a/XenonUtils/disasm.h
++++ b/XenonUtils/disasm.h
+@@ -1,4 +1,5 @@
+ #pragma once
++#include <cstdio>
+ #include <dis-asm.h>
+ #include <ppc.h>
+ 
+@@ -32,4 +33,29 @@ namespace ppc
+     }
+ 
+     static int Disassemble(const void* code, uint64_t base, ppc_insn* out, size_t nOut);
++
++    // binutils (cell 64) decodifica como instruccion PPC405/440 (mulchw, mulhhwu, mac*...; sin VMX) palabras de opcode primario 4 que en la
++    // Xbox 360 son VMX128 `vsldoi128` (VX128_5). Xenia (ppc_opcode_lookup_gen.cc, opcode 4): si ninguna rama VX/VC/VA (bits 21-31, 22-31, 26-31)
++    // coincide y el bit 27 (0x10) es 1, la palabra es vsldoi128. Todas las instrucciones PPC405/440 de opcode 4 tienen el bit 0x10 a 1.
++    // Campos VX128_5 (ppc_decode_data.h): VD=[25:21]|[3:2]<<5, VA=[20:16]|[5]<<5|[10]<<6, VB=[15:11]|[1:0]<<5, SH=[9:6].
++    inline bool FixMisdecodedVsldoi128(const ppc_insn& in, uint32_t word, ppc_insn& out)
++    {
++        constexpr uint32_t kFlagAltivec = 0x200, kFlagVmx128 = 0x1000000;   // PPC_OPCODE_ALTIVEC / PPC_OPCODE_VMX_128 (ppc-dis.c)
++        if (in.opcode == nullptr || (word >> 26) != 4 || (word & 0x10) == 0 || (in.opcode->flags & (kFlagAltivec | kFlagVmx128)) != 0)
++            return false;
++
++        static powerpc_opcode fixedOpcode;
++        fixedOpcode = *in.opcode;
++        fixedOpcode.name = "vsldoi128";
++        fixedOpcode.id = PPC_INST_VSLDOI128;
++
++        out = in;
++        out.opcode = &fixedOpcode;
++        out.operands[0] = ((word >> 21) & 0x1F) | (((word >> 2) & 0x3) << 5);
++        out.operands[1] = ((word >> 16) & 0x1F) | (((word >> 5) & 0x1) << 5) | (((word >> 10) & 0x1) << 6);
++        out.operands[2] = ((word >> 11) & 0x1F) | ((word & 0x3) << 5);
++        out.operands[3] = (word >> 6) & 0xF;
++        std::snprintf(out.op_str, sizeof(out.op_str), "v%u,v%u,v%u,%u", out.operands[0], out.operands[1], out.operands[2], out.operands[3]);
++        return true;
++    }
+ }
+diff --git a/XenonUtils/ppc_context.h b/XenonUtils/ppc_context.h
+index 31a86cd..0dd8dd7 100644
+--- a/XenonUtils/ppc_context.h
++++ b/XenonUtils/ppc_context.h
+@@ -653,6 +653,29 @@ inline simde__m128 simde_mm_cvtepu32_ps_(simde__m128i src1)
+     return simde_mm_blendv_ps(xmm2, simde_mm_castsi128_ps(xmm0), simde_mm_castsi128_ps(src1));
+ }
+ 
++// ---- binary16 (IEEE 754-2008) <-> binary32, para vpkd3d128 / vupkd3d128 tipo FLOAT16_4 (Skylanders: Swap Force) ----
++// Referencia: Xenia, cpu/backend/x64/x64_seq_vector.cc (PACK/UNPACK FLOAT16_4) y third_party/half (float2half<round_toward_zero>).
++// Trabajan con los bits del float para no depender del entorno de coma flotante (MXCSR).
++inline uint16_t ppc_f32bits_to_f16_rz(uint32_t bits)
++{
++    uint32_t sign = (bits >> 16) & 0x8000u, e = (bits >> 23) & 0xFFu, m = bits & 0x7FFFFFu;
++    if (e == 0xFFu) return uint16_t(sign | 0x7C00u | (m ? (0x0200u | (m >> 13)) : 0u)); // infinito / NaN (silenciado)
++    if (e >= 143u) return uint16_t(sign | 0x7BFFu);                                      // desbordamiento: redondeo a cero -> mayor finito
++    if (e >= 113u) return uint16_t(sign | ((e - 112u) << 10) | (m >> 13));              // normal
++    if (e >= 103u) return uint16_t(sign | (((1u << 23) | m) >> (126u - e)));            // subnormal (truncado)
++    return uint16_t(sign);                                                               // subdesbordamiento -> +-0
++}
++
++inline uint32_t ppc_f16_to_f32bits(uint16_t h)
++{
++    uint32_t sign = (uint32_t(h) & 0x8000u) << 16, e = (h >> 10) & 0x1Fu, m = h & 0x3FFu;
++    if (e == 0x1Fu) return sign | 0x7F800000u | (m ? (0x400000u | (m << 13)) : 0u);     // infinito / NaN (silenciado)
++    if (e != 0u) return sign | ((e + 112u) << 23) | (m << 13);                          // normal
++    if (m == 0u) return sign;                                                            // +-0
++    uint32_t sh = uint32_t(__builtin_clz(m)) - 21u;                                      // subnormal: normalizar (m < 0x400)
++    return sign | ((113u - sh) << 23) | (((m << sh) & 0x3FFu) << 13);
++}
++
+ inline simde__m128i simde_mm_perm_epi8_(simde__m128i a, simde__m128i b, simde__m128i c)
+ {
+     simde__m128i d = simde_mm_set1_epi8(0xF);
