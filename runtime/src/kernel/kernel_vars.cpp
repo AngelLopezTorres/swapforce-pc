@@ -1,6 +1,10 @@
 #include "kernel_vars.h"
 
+#include <atomic>
 #include <cstring>
+#include <thread>
+
+#include <windows.h>
 
 #include "guest_memory.h"
 #include "import_log.h"
@@ -27,6 +31,7 @@ constexpr uint32_t kVarArea = 0x85010000;   // datos de variables (0x400 por var
 constexpr uint32_t kModuleStruct = 0x85020000; // estructura de modulo (LDR) minima
 
 static uint32_t g_addr[kKernelVarCount];
+static void StartTimeStampBundleTimer();
 
 uint32_t KernelVarAddress(const char* name) {
     for (int i = 0; i < kKernelVarCount; ++i)
@@ -63,7 +68,44 @@ int InitKernelVars(uint32_t xexHeaderGuest) {
     // se guarda la direccion de la cabecera XEX en +0x58 [NV: offset de X_LDR_DATA_TABLE_ENTRY].
     GuestMemory::Write32(KernelVarAddress("XexExecutableModuleHandle"), kModuleStruct);
     GuestMemory::Write32(kModuleStruct + 0x58, xexHeaderGuest);
+    StartTimeStampBundleTimer();
     return ok;
+}
+
+// KeTimeStampBundle (X_TIME_STAMP_BUNDLE: +0 interrupt_time u64, +8 system_time u64, +16 tick_count u32, +20 relleno).
+// Xenia (xboxkrnl_module.cc, XboxkrnlModule::XboxkrnlModule): +0/+8 = 0, +16 = Clock::QueryGuestUptimeMillis(),
+// actualizado por un temporizador de 1 ms. El GetTickCount del XDK lee +16 (sub_82F42528: lwz r3,16([0x820009A4]));
+// sin esta actualizacion el reloj de Bink (sub_83085560) devuelve 0 siempre y BinkWait (sub_830804C8) no libera
+// ningun fotograma. Aqui: milisegundos desde el arranque por QueryPerformanceCounter, hilo host con temporizador
+// de alta resolucion de 1 ms (Sleep(1) si no esta disponible).
+void StartTimeStampBundleTimer() {
+    static std::atomic<bool> started{false};
+    if (started.exchange(true)) return;
+    const uint32_t a = KernelVarAddress("KeTimeStampBundle");
+    if (!a) return;
+    LARGE_INTEGER f, t0;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t0);
+    auto update = [a, f, t0]() {
+        LARGE_INTEGER t;
+        QueryPerformanceCounter(&t);
+        uint64_t ms = (uint64_t)(t.QuadPart - t0.QuadPart) * 1000ull / (uint64_t)f.QuadPart;
+        GuestMemory::Write32(a + 16, (uint32_t)ms);
+    };
+    update();
+    std::thread([update]() {
+        HANDLE tm = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        if (tm) {
+            LARGE_INTEGER due;
+            due.QuadPart = -10000; // 1 ms (unidades de 100 ns, relativo)
+            SetWaitableTimer(tm, &due, 1, nullptr, nullptr, FALSE);
+        }
+        ImportLog::Get().Printf("KeTimeStampBundle: temporizador 1 ms %s", tm ? "alta resolucion" : "Sleep(1)");
+        for (;;) {
+            if (tm) WaitForSingleObject(tm, INFINITE); else Sleep(1);
+            update();
+        }
+    }).detach();
 }
 
 } // namespace rt

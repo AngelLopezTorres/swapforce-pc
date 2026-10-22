@@ -22,6 +22,7 @@ ppc/
 runtime/ppc_gen/
 runtime/ppc_sources.cmake
 runtime/src/kernel/import_stubs.gen.cpp
+runtime/src/kernel/bink_probe_gen.inc
 analysis/SwapForce.toml
 analysis/SwapForce_switch_tables.toml
 analysis/recomp_*.txt
