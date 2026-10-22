@@ -22,6 +22,8 @@
 namespace rt::gpu { int Pm4SelfTest(); }
 int RunCpuSelfTest(uint64_t n, uint64_t seed);   // selftest\cpu_selftest.cpp
 namespace rt { extern bool g_noAudio; void AudioSummary(); void BinkProbeReport(); }
+PPC_EXTERN_FUNC(__imp__XamInputGetState);
+PPC_EXTERN_FUNC(__imp__XamInputGetCapabilities);
 
 PPC_EXTERN_FUNC(_xstart);
 PPC_EXTERN_FUNC(__imp__NtCreateFile);
@@ -92,13 +94,14 @@ int main(int argc, char** argv) {
     SetUnhandledExceptionFilter(CrashFilter);
     auto& log = rt::ImportLog::Get();
     std::string logPath = "runtime.log";
-    bool selftest = false, iotest = false;
+    bool selftest = false, iotest = false, inputSelfTest = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--max-imports") && i + 1 < argc) log.Config().maxImports = std::strtoull(argv[++i], nullptr, 0);
         else if (!std::strcmp(argv[i], "--log") && i + 1 < argc) logPath = argv[++i];
         else if (!std::strcmp(argv[i], "--log-all")) log.Config().logAll = true;
         else if (!std::strcmp(argv[i], "--selftest-load")) selftest = true;
         else if (!std::strcmp(argv[i], "--io-selftest")) iotest = true;
+        else if (!std::strcmp(argv[i], "--selftest-input")) inputSelfTest = true;
         else if (!std::strcmp(argv[i], "--gpu-regdump")) rt::gpu::Cfg().regDump = true;
         else if (!std::strcmp(argv[i], "--gpu-log") && i + 1 < argc) rt::gpu::Cfg().logPath = argv[++i];
         else if (!std::strcmp(argv[i], "--gpu-statelog")) rt::gpu::Cfg().stateLog = true;
@@ -137,6 +140,24 @@ int main(int argc, char** argv) {
         }
     }
     if (!log.Open(logPath)) { std::fprintf(stderr, "no se puede abrir %s\n", logPath.c_str()); return 2; }
+
+    if (inputSelfTest) {
+        if (!rt::GuestMemory::Init()) { std::printf("input-selftest: GuestMemory::Init fallo\n"); return 2; }
+        constexpr uint32_t out = 0x85030000;
+        if (!rt::GuestMemory::Commit(out, 0x1000)) { std::printf("input-selftest: Commit fallo\n"); return 2; }
+        auto* ctx = new PPCContext{};
+        auto* base = rt::GuestMemory::Base();
+        ctx->r3.u64=0; ctx->r5.u64=out;
+        __imp__XamInputGetState(*ctx,base);
+        uint32_t stateRc=ctx->r3.u32, buttons=rt::G16(base,out+4);
+        ctx->r3.u64=0; ctx->r4.u64=0; ctx->r5.u64=out+0x100;
+        __imp__XamInputGetCapabilities(*ctx,base);
+        uint32_t capsRc=ctx->r3.u32;
+        bool ok=stateRc==0 && capsRc==0;
+        std::printf("input-selftest state=%08X buttons=0x%04X capabilities=%08X %s\n",stateRc,buttons,capsRc,ok?"OK":"FALLO");
+        delete ctx;
+        return ok?0:1;
+    }
 
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--selftest-gpu") && i + 1 < argc) {
