@@ -56,7 +56,7 @@ target_compile_definitions(SwapForceRT PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT
 
 # Pila del hilo principal grande (la recompilacion produce llamadas anidadas profundas).
 target_link_options(SwapForceRT PRIVATE /STACK:268435456 /SUBSYSTEM:CONSOLE /INCREMENTAL:NO /MAP:SwapForceRT.map)
-target_link_libraries(SwapForceRT PRIVATE)
+target_link_libraries(SwapForceRT PRIVATE setupapi)
 
 set(SWAPFORCE_OUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/build" CACHE PATH "Directorio de salida del ejecutable")
 set_target_properties(SwapForceRT PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${SWAPFORCE_OUT_DIR}")

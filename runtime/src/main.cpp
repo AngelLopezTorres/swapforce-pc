@@ -18,12 +18,19 @@
 #include "gpu.h"
 #include "d3d12_backend.h"
 #include "ucode_hlsl.h"
+#include "hid/portal.h"
+#include "audio/xma_context.h"
 
 namespace rt::gpu { int Pm4SelfTest(); }
 int RunCpuSelfTest(uint64_t n, uint64_t seed);   // selftest\cpu_selftest.cpp
 namespace rt { extern bool g_noAudio; void AudioSummary(); void BinkProbeReport(); }
 PPC_EXTERN_FUNC(__imp__XamInputGetState);
 PPC_EXTERN_FUNC(__imp__XamInputGetCapabilities);
+PPC_EXTERN_FUNC(__imp__XexGetModuleHandle);
+PPC_EXTERN_FUNC(__imp__XexGetProcedureAddress);
+PPC_EXTERN_FUNC(__imp__XexUnloadImage);
+PPC_EXTERN_FUNC(__imp__XMACreateContext);
+PPC_EXTERN_FUNC(__imp__XMAReleaseContext);
 
 PPC_EXTERN_FUNC(_xstart);
 PPC_EXTERN_FUNC(__imp__NtCreateFile);
@@ -70,6 +77,122 @@ static int IoSelfTest(rt::ImportLog& log) {
     return ok ? 0 : 1;
 }
 
+static bool XamPortalExportSelfTest(uint8_t* base) {
+    constexpr uint32_t scratch = 0x85030000;
+    if (!rt::GuestMemory::Commit(scratch, 0x1000)) return false;
+
+    constexpr char moduleName[] = "xam.xex";
+    std::memcpy(base + scratch + 0x100, moduleName, sizeof(moduleName));
+    PPCContext ctx{};
+    ctx.r3.u64 = scratch + 0x100;
+    ctx.r4.u64 = scratch + 0x20;
+    __imp__XexGetModuleHandle(ctx, base);
+    if (ctx.r3.u32 != 0) return false;
+    uint32_t handle = rt::G32(base, scratch + 0x20);
+
+    auto resolve = [&](uint32_t ordinal, uint32_t expectedGuest, uint32_t expectedResult) {
+        ctx = PPCContext{};
+        ctx.r3.u64 = handle;
+        ctx.r4.u64 = ordinal;
+        ctx.r5.u64 = scratch + 0x24;
+        __imp__XexGetProcedureAddress(ctx, base);
+        uint32_t address = rt::G32(base, scratch + 0x24);
+        if (ctx.r3.u32 != expectedResult || address != expectedGuest) return false;
+        if (!expectedGuest) return true;
+        PPCFunc* thunk = PPC_LOOKUP_FUNC(base, address);
+        if (!thunk) return false;
+        ctx = PPCContext{};
+        thunk(ctx, base);
+        return ctx.r3.u32 == 0xC00000BB;
+    };
+
+    bool ok = resolve(0x4A1, 0x830A9EE0, 0) && resolve(0x4A2, 0x830A9EE4, 0) &&
+              resolve(0x4A3, 0, 0xC0000225);
+    ctx = PPCContext{};
+    ctx.r3.u64 = handle;
+    __imp__XexUnloadImage(ctx, base);
+    return ok;
+}
+
+static bool XmaSelfTest(uint8_t* base) {
+    constexpr uint32_t scratch = 0x85034000;
+    if (!rt::GuestMemory::Commit(scratch, 0x1000)) return false;
+
+    PPCContext ctx{};
+    ctx.r3.u64 = scratch;
+    __imp__XMACreateContext(ctx, base);
+    uint32_t createStatus = ctx.r3.u32;
+    uint32_t first = rt::G32(base, scratch);
+    if (createStatus != 0 || !first) {
+        std::printf("xma-selftest create=%08X context=%08X -> FALLO\n", createStatus, first);
+        return false;
+    }
+    uint32_t contextArray = rt::audio::XmaContextArrayGuestAddress();
+
+    bool layout = sizeof(rt::audio::XmaContextData) == 64 && first == contextArray &&
+                  rt::G32(base, rt::audio::kXmaContextArrayAddressRegister) == (contextArray & 0x1FFFFFFF) &&
+                  rt::G32(base, rt::audio::kXmaCurrentContextIndexRegister) == 0 &&
+                  rt::G32(base, rt::audio::kXmaNextContextIndexRegister) == 1;
+    const uint32_t input0Word = static_cast<uint32_t>(rt::audio::XmaContextWord::Input0PhysicalAddress);
+    const uint32_t outputFlagsWord = static_cast<uint32_t>(rt::audio::XmaContextWord::OutputReadOffsetAndFlags);
+    rt::P32(base, first + input0Word * 4, 0x01234567);
+    rt::P32(base, first + outputFlagsWord * 4, 0xC0000000);
+    layout = layout && rt::G32(base, first + input0Word * 4) == 0x01234567 &&
+             rt::G32(base, first + outputFlagsWord * 4) == 0xC0000000;
+
+    bool registers = rt::audio::WriteXmaRegister(rt::audio::kXmaCurrentContextIndexRegister, 7) &&
+                     rt::audio::WriteXmaRegister(rt::audio::kXmaNextContextIndexRegister, 8) &&
+                     rt::audio::ReadXmaRegister(rt::audio::kXmaCurrentContextIndexRegister) == 7 &&
+                     rt::audio::ReadXmaRegister(rt::audio::kXmaNextContextIndexRegister) == 8;
+
+    uint64_t requestsBefore = rt::audio::XmaDecodeRequestCount();
+    auto boundary = rt::audio::SubmitXmaDecode(first);
+    bool decoderBoundary = boundary == rt::audio::XmaDecodeBoundaryResult::BackendUnavailable &&
+                           !rt::audio::XmaDecoderBackendAvailable() &&
+                           rt::audio::XmaDecodeRequestCount() == requestsBefore + 1;
+
+    ctx = PPCContext{};
+    ctx.r3.u64 = scratch + 4;
+    __imp__XMACreateContext(ctx, base);
+    uint32_t secondStatus = ctx.r3.u32;
+    uint32_t second = rt::G32(base, scratch + 4);
+    if (secondStatus != 0 || !second) {
+        ctx = PPCContext{};
+        ctx.r3.u64 = first;
+        __imp__XMAReleaseContext(ctx, base);
+        return false;
+    }
+    bool allocation = secondStatus == 0 && second == first + rt::audio::kXmaContextBytes;
+
+    ctx = PPCContext{};
+    ctx.r3.u64 = first;
+    __imp__XMAReleaseContext(ctx, base);
+    bool released = ctx.r3.u32 == 0 && rt::G32(base, first) == 0 &&
+                    !rt::audio::ReleaseXmaContext(first);
+    ctx = PPCContext{};
+    ctx.r3.u64 = second;
+    __imp__XMAReleaseContext(ctx, base);
+    released = released && ctx.r3.u32 == 0 && rt::G32(base, second) == 0;
+
+    uint32_t allocated[rt::audio::kXmaContextCount]{};
+    uint32_t count = 0;
+    for (; count < rt::audio::kXmaContextCount; ++count) {
+        allocated[count] = rt::audio::CreateXmaContext();
+        if (!allocated[count]) break;
+    }
+    bool exhaustion = count == rt::audio::kXmaContextCount && rt::audio::CreateXmaContext() == 0;
+    for (uint32_t i = 0; i < count; ++i) released = rt::audio::ReleaseXmaContext(allocated[i]) && released;
+    exhaustion = exhaustion && count == rt::audio::kXmaContextCount;
+
+    bool ok = createStatus == 0 && first != 0 && layout && registers && decoderBoundary && allocation && released && exhaustion;
+    std::printf("xma-selftest create=%08X context=%08X array=%08X layout=%s registers=%s decode-boundary=%s requests=%llu release=%s capacity=%u/%u -> %s\n",
+                createStatus, first, contextArray, layout ? "OK" : "FAIL", registers ? "OK" : "FAIL",
+                decoderBoundary ? "BACKEND_UNAVAILABLE" : "FAIL",
+                static_cast<unsigned long long>(rt::audio::XmaDecodeRequestCount()),
+                released ? "OK" : "FAIL", count, rt::audio::kXmaContextCount, ok ? "OK" : "FALLO");
+    return ok;
+}
+
 static bool LoadAll(std::string& err, rt::ImageLoadResult& img, rt::XexHeaderInfo& xex, int& vars) {
     if (!rt::LoadPaths(const_cast<rt::Paths&>(rt::GetPaths()), &err)) return false;
     if (!rt::GuestMemory::Init()) { err = "no se puede reservar 4 GB alineados"; return false; }
@@ -94,7 +217,7 @@ int main(int argc, char** argv) {
     SetUnhandledExceptionFilter(CrashFilter);
     auto& log = rt::ImportLog::Get();
     std::string logPath = "runtime.log";
-    bool selftest = false, iotest = false, inputSelfTest = false;
+    bool selftest = false, iotest = false, inputSelfTest = false, portalSelfTest = false, xmaSelfTest = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--max-imports") && i + 1 < argc) log.Config().maxImports = std::strtoull(argv[++i], nullptr, 0);
         else if (!std::strcmp(argv[i], "--log") && i + 1 < argc) logPath = argv[++i];
@@ -102,6 +225,8 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--selftest-load")) selftest = true;
         else if (!std::strcmp(argv[i], "--io-selftest")) iotest = true;
         else if (!std::strcmp(argv[i], "--selftest-input")) inputSelfTest = true;
+        else if (!std::strcmp(argv[i], "--selftest-portal")) portalSelfTest = true;
+        else if (!std::strcmp(argv[i], "--selftest-xma")) xmaSelfTest = true;
         else if (!std::strcmp(argv[i], "--gpu-regdump")) rt::gpu::Cfg().regDump = true;
         else if (!std::strcmp(argv[i], "--gpu-log") && i + 1 < argc) rt::gpu::Cfg().logPath = argv[++i];
         else if (!std::strcmp(argv[i], "--gpu-statelog")) rt::gpu::Cfg().stateLog = true;
@@ -157,6 +282,33 @@ int main(int argc, char** argv) {
         std::printf("input-selftest state=%08X buttons=0x%04X capabilities=%08X %s\n",stateRc,buttons,capsRc,ok?"OK":"FALLO");
         delete ctx;
         return ok?0:1;
+    }
+
+    if (portalSelfTest) {
+        if (!rt::GuestMemory::Init()) { std::printf("portal-selftest: GuestMemory::Init fallo\n"); return 2; }
+        uint8_t* base = rt::GuestMemory::Base();
+        bool dispatch = XamPortalExportSelfTest(base);
+        rt::hid::PortalProbeResult probe;
+        bool probeCall = rt::hid::ProbePortal(probe);
+        bool physical = probeCall && rt::hid::PortalProbeAccepted(probe);
+        std::printf("portal-selftest dispatch=%s get/set=0x4A1/0x4A2 unknown=0xC0000225; ", dispatch ? "OK" : "FALLO");
+        std::printf("device=%s open=%s interface0=%s interrupt-in=%s read=%s bytes=%u endpoint=0x%02X error=%lu detail=%s -> %s\n",
+                    probe.found ? "present" : "missing", probe.opened ? "yes" : "no",
+                    probe.interfaceZero ? "yes" : "no", probe.interruptInFound ? "yes" : "no",
+                    probe.readSucceeded ? "complete" : (probe.readTimedOut ? "timeout" : (probe.readAttempted ? "failed" : "not-attempted")),
+                    probe.bytesRead, probe.endpoint, static_cast<unsigned long>(probe.error), probe.detail.c_str(),
+                    dispatch && physical ? "OK" : "FALLO");
+        log.Printf("portal-selftest dispatch=%s probe=%s endpoint=0x%02X bytes=%u error=%lu",
+                   dispatch ? "OK" : "FALLO", physical ? "OK" : "FALLO", probe.endpoint,
+                   probe.bytesRead, static_cast<unsigned long>(probe.error));
+        return dispatch && physical ? 0 : 1;
+    }
+
+    if (xmaSelfTest) {
+        if (!rt::GuestMemory::Init()) { std::printf("xma-selftest: GuestMemory::Init fallo\n"); return 2; }
+        bool ok = XmaSelfTest(rt::GuestMemory::Base());
+        log.Printf("xma-selftest %s", ok ? "OK" : "FALLO");
+        return ok ? 0 : 1;
     }
 
     for (int i = 1; i < argc; ++i) {

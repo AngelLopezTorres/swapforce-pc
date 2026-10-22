@@ -22,6 +22,7 @@
 #include "guest_heap.h"
 #include "guest_thread.h"
 #include "import_log.h"
+#include "../audio/xma_context.h"
 
 #pragma comment(lib, "winmm.lib")
 
@@ -194,4 +195,20 @@ GUEST_IMPORT_IMPL(XAudioSubmitRenderDriverFrame) {
     g_playEnd = start + period;
     g_play.push_back({idx, g_playEnd});
     ++g_submits;
+}
+
+GUEST_IMPORT_IMPL(XMACreateContext) {
+    ImportScope sc("XMACreateContext", ctx, base);
+    if (!ctx.r3.u32) { SetRet(ctx, 0xC000000D); return; } // STATUS_INVALID_PARAMETER
+    uint32_t context = rt::audio::CreateXmaContext();
+    P32(base, ctx.r3.u32, context);
+    if (!context) { SetRet(ctx, 0xC0000017); return; } // STATUS_NO_MEMORY
+    SetRet(ctx, ST_SUCCESS);
+}
+
+GUEST_IMPORT_IMPL(XMAReleaseContext) {
+    ImportScope sc("XMAReleaseContext", ctx, base);
+    if (!rt::audio::ReleaseXmaContext(ctx.r3.u32))
+        ImportLog::Get().Printf("XMA: ReleaseContext ignorado para contexto invalido %08X", ctx.r3.u32);
+    SetRet(ctx, ST_SUCCESS);
 }
