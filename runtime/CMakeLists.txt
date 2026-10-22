@@ -62,7 +62,12 @@ set(SWAPFORCE_OUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/build" CACHE PATH "Directorio
 set_target_properties(SwapForceRT PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${SWAPFORCE_OUT_DIR}")
 
 # DXC (H2): compilador HLSL -> DXIL junto al ejecutable (de la copia de XenosRecomp, MIT/NCSA)
-set(DXC_BIN "${SWAPFORCE_ROOT}/tools/XenosRecomp/thirdparty/dxc-bin/bin/x64")
+# Orden: DXC descargado por setup.ps1 (tools/dxc), si no, la copia de XenosRecomp del arbol de desarrollo.
+if(EXISTS "${SWAPFORCE_ROOT}/tools/dxc/bin/x64/dxcompiler.dll")
+  set(DXC_BIN "${SWAPFORCE_ROOT}/tools/dxc/bin/x64")
+else()
+  set(DXC_BIN "${SWAPFORCE_ROOT}/tools/XenosRecomp/thirdparty/dxc-bin/bin/x64")
+endif()
 add_custom_command(TARGET SwapForceRT POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DXC_BIN}/dxcompiler.dll" "$<TARGET_FILE_DIR:SwapForceRT>/dxcompiler.dll"
   COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DXC_BIN}/dxil.dll" "$<TARGET_FILE_DIR:SwapForceRT>/dxil.dll")
