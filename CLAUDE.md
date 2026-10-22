@@ -30,3 +30,8 @@ Formal, escueto, metódico; solo datos objetivos y documentables, sin opiniones;
 
 ## Entorno
 Windows 11, VS Build Tools 2022, LLVM/clang-cl, CMake, Ninja (rutas fijadas en `runtime\tools\vsenv.cmd`). Probado solo con RTX 4070 SUPER (y WARP). Salida estándar del exe muy voluminosa: redirigir a fichero.
+
+## Actualizacion 2026-10-23 (tras unir ramas)
+- Rama codex-m4m5 unida a main (XMA contextos, Portal USB selftest, entrada XInput). Compilado y ejecutado en un worktree con ppc_gen: --selftest-input/portal/xma/cpu OK, --selftest-gpu OK; ejecucion headless 150 s: ~28 fps de VdSwap medios, 0 excepciones guest (el hilo 41 ya no muere), pero la imagen queda en BLANCO uniforme (hash fijo 21AEC9254EADB383, ~596 draws y 46 resolves por frame) desde el fotograma ~650, justo tras el video Bink 2 de Vicarious Visions; el juego no carga mas .pak despues de gsbp_vvisions.bk2. Causa sin determinar [NV]: el juego queda parado (hash identico durante miles de fotogramas) o la escena final se renderiza blanca; hipotesis: fundido a blanco congelado, aproximaciones SIMPLIFY del backend, shader de composicion, textura vacia.
+- Siguiente paso: localizar con volcados de resolves (--dump-resolves) y volcado de hilos (--perf) donde espera el hilo principal y que pasada produce el blanco.
+- Reparto de agentes previsto: planifica Sonnet, ejecuta Haiku (Codex: gpt-6-luna esfuerzo max cuando haya tokens). Antigravity descartado (cuota agotada). Rama agy-pak (analisis .pak) NO unida: contiene CSV con nombres de assets del juego (decision legal pendiente).
