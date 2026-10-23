@@ -339,7 +339,8 @@ HostTexture* D3D12Backend::GetTexture(uint32_t idx, bool vertexStage) {
         if (!g_texMemoOff) texMemo[memoKey] = {baseAddr, (uint32_t)std::min<uint64_t>((uint64_t)baseAddr + needBytes, 0xFFFFFFFFull), dataHash};
     }
     auto it = textures.find(key);
-    if (it != textures.end() && it->second.dataHash == dataHash && it->second.res) { it->second.lastUse = ++texSerial; ++texHits; return &it->second; }
+    const bool debugDump = debugDumpTextureBase == baseAddr && debugDumpTextureFrame == rt::gpu::FrameCount() + 1 && debugDumpTextureDraw == drawSerial;
+    if (it != textures.end() && it->second.dataHash == dataHash && it->second.res && !debugDump) { it->second.lastUse = ++texSerial; ++texHits; return &it->second; }
     // ---- conversion a datos lineales del host ----
     bool srgb = (uint32_t)tf.sign_x == 3 && fi.dxgi != fi.srgb;
     DXGI_FORMAT dfmt = srgb ? fi.srgb : fi.dxgi;
@@ -465,7 +466,7 @@ HostTexture* D3D12Backend::GetTexture(uint32_t idx, bool vertexStage) {
     ht.dataHash = dataHash; ht.lastUse = ++texSerial;
     if (SeqLog()) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); ImportLog::Get().Printf("M8SEQ UPLOAD fetch=%u base=%08X %ux%u fmt=%s expand=%d bytes=%zu us=%.0f", idx, baseAddr, width, height, TexFmtName(fmtId), fi.expand, lin.size(), (perf::Now() - m8t0) * 1e6 / f.QuadPart); }
     ++texUploads;
-    if (textureDumps < opt.dumpTextures) {
+    if (textureDumps < opt.dumpTextures || debugDump) {
         std::vector<uint8_t> img;
         uint32_t sw4[4] = {tf.swizzle & 7u, (tf.swizzle >> 3) & 7u, (tf.swizzle >> 6) & 7u, (tf.swizzle >> 9) & 7u};
         bool ok = true;
@@ -480,7 +481,10 @@ HostTexture* D3D12Backend::GetTexture(uint32_t idx, bool vertexStage) {
                 for (size_t i = 0; i < img.size(); i += 4) { uint8_t c[4] = {img[i], img[i + 1], img[i + 2], img[i + 3]}; for (int k = 0; k < 4; ++k) img[i + k] = sw4[k] <= 3 ? c[sw4[k]] : (sw4[k] == 5 ? 255 : 0); }
             for (size_t i = 3; i < img.size(); i += 4) img[i] = 255;   // sin alfa para poder verlo
             char nm[128];
-            std::snprintf(nm, sizeof(nm), "\\tex_%03u_%s_%ux%u_%08X.png", textureDumps, TexFmtName(fmtId), width, height, baseAddr);
+            if (debugDump)
+                std::snprintf(nm, sizeof(nm), "\\dbg_tex_%08X_draw%llu_%s_%ux%u.png", baseAddr, (unsigned long long)drawSerial, TexFmtName(fmtId), width, height);
+            else
+                std::snprintf(nm, sizeof(nm), "\\tex_%03u_%s_%ux%u_%08X.png", textureDumps, TexFmtName(fmtId), width, height, baseAddr);
             std::string path = rt::gpu::FramesDir() + nm;
             bool okp = WritePngRGBA(path, width, height, img.data(), width * 4);
             ImportLog::Get().Printf("D3D12 volcado de textura -> %s %s", path.c_str(), okp ? "OK" : "FALLO");

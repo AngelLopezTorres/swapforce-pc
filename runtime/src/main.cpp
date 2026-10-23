@@ -21,11 +21,16 @@
 #include "perf.h"
 #include "hid/portal.h"
 #include "audio/xma_context.h"
+#include "kernel/xboxkrnl_sync.h"
 
 namespace rt::gpu { int Pm4SelfTest(); extern bool g_fbSlowPath, g_fbVerify; }
 namespace rt::gpu::d3d { extern bool g_texSlowPath, g_texVerify, g_resolveSlowPath, g_resolveVerify, g_texMemoOff, g_resolveSync, g_noResolveShortcut, g_resolveNoDse, g_verifyShortcut; extern unsigned g_rowThreads, g_kickDraws, g_kickResolveDraws; extern bool g_windowNoActivate; extern bool g_asyncResolveWriter; }
+namespace rt::gpu::d3d { void SetDumpHlslHash(uint64_t hash); }
 int RunCpuSelfTest(uint64_t n, uint64_t seed);   // selftest\cpu_selftest.cpp
 namespace rt { extern bool g_binkProbeOn; extern bool g_importSerialize; extern bool g_noAudio; void AudioSummary(); void BinkProbeReport(); }
+namespace rt { void ConfigureInputStartInjection(uint32_t afterCalls, uint32_t durationCalls); }
+namespace rt { void ConfigureXamUser0SignedIn(bool enabled, uint32_t afterCalls); }
+static std::string g_userdataOverride;
 PPC_EXTERN_FUNC(__imp__XamInputGetState);
 PPC_EXTERN_FUNC(__imp__XamInputGetCapabilities);
 PPC_EXTERN_FUNC(__imp__XexGetModuleHandle);
@@ -216,6 +221,7 @@ static bool XmaSelfTest(uint8_t* base) {
 
 static bool LoadAll(std::string& err, rt::ImageLoadResult& img, rt::XexHeaderInfo& xex, int& vars) {
     if (!rt::LoadPaths(const_cast<rt::Paths&>(rt::GetPaths()), &err)) return false;
+    if (!g_userdataOverride.empty()) rt::SetUserdataDir(g_userdataOverride);
     if (!rt::GuestMemory::Init()) { err = "no se puede reservar 4 GB alineados"; return false; }
     if (!rt::LoadGameImage(rt::GetPaths().image, img, &err)) return false;
     if (!rt::LoadXexHeader(rt::GetPaths().xex, xex, &err)) return false;
@@ -240,9 +246,20 @@ int main(int argc, char** argv) {
     std::string logPath = "runtime.log";
     bool selftest = false, iotest = false, inputSelfTest = false, portalSelfTest = false, xmaSelfTest = false;
     std::string perfOut;
+    std::string userdataOverride;
+    uint32_t traceKernelHandle = 0;
+    uint32_t inputStartAfterCalls = 0, inputStartDurationCalls = 0;
+    bool testUser0SignedIn = false;
+    uint32_t testUser0SignedInAfterCalls = 0;
+    uint64_t dumpHlslHash = 0;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--max-imports") && i + 1 < argc) log.Config().maxImports = std::strtoull(argv[++i], nullptr, 0);
         else if (!std::strcmp(argv[i], "--log") && i + 1 < argc) logPath = argv[++i];
+        else if (!std::strcmp(argv[i], "--userdata-dir") && i + 1 < argc) userdataOverride = argv[++i];
+        else if (!std::strcmp(argv[i], "--inject-start-after-calls") && i + 1 < argc) inputStartAfterCalls = (uint32_t)std::strtoul(argv[++i], nullptr, 0);
+        else if (!std::strcmp(argv[i], "--inject-start-duration-calls") && i + 1 < argc) inputStartDurationCalls = (uint32_t)std::strtoul(argv[++i], nullptr, 0);
+        else if (!std::strcmp(argv[i], "--test-user0-signed-in")) testUser0SignedIn = true;
+        else if (!std::strcmp(argv[i], "--test-user0-signed-in-after-calls") && i + 1 < argc) { testUser0SignedIn = true; testUser0SignedInAfterCalls = (uint32_t)std::strtoul(argv[++i], nullptr, 0); }
         else if (!std::strcmp(argv[i], "--log-all")) log.Config().logAll = true;
         else if (!std::strcmp(argv[i], "--selftest-load")) selftest = true;
         else if (!std::strcmp(argv[i], "--io-selftest")) iotest = true;
@@ -252,6 +269,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--gpu-regdump")) rt::gpu::Cfg().regDump = true;
         else if (!std::strcmp(argv[i], "--gpu-log") && i + 1 < argc) rt::gpu::Cfg().logPath = argv[++i];
         else if (!std::strcmp(argv[i], "--gpu-statelog")) rt::gpu::Cfg().stateLog = true;
+        else if (!std::strcmp(argv[i], "--gpu-statelog-frame") && i + 1 < argc) { rt::gpu::Cfg().stateLog = true; rt::gpu::Cfg().stateLogFrame = std::strtoull(argv[++i], nullptr, 0); }
         else if (!std::strcmp(argv[i], "--gpu-hist")) rt::gpu::Cfg().hist = true;
         else if (!std::strcmp(argv[i], "--frames-dir") && i + 1 < argc) rt::gpu::Cfg().framesDir = argv[++i];
         else if (!std::strcmp(argv[i], "--shader-scan")) rt::gpu::Cfg().shaderScan = true;
@@ -284,7 +302,10 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--d3d-stats")) rt::gpu::Cfg().d3dStats = true;
         else if (!std::strcmp(argv[i], "--dump-textures") && i + 1 < argc) rt::gpu::Cfg().dumpTextures = (uint32_t)std::strtoul(argv[++i], nullptr, 0);
         else if (!std::strcmp(argv[i], "--dump-resolves") && i + 1 < argc) rt::gpu::Cfg().dumpResolves = (uint32_t)std::strtoul(argv[++i], nullptr, 0);
+        else if (!std::strcmp(argv[i], "--dump-resolves-frame") && i + 1 < argc) rt::gpu::Cfg().dumpResolveFrame = std::strtoull(argv[++i], nullptr, 0);
+        else if (!std::strcmp(argv[i], "--gpu-dump-hlsl-hash") && i + 1 < argc) dumpHlslHash = std::strtoull(argv[++i], nullptr, 16);
         else if (!std::strcmp(argv[i], "--dump-frames") && i + 1 < argc) rt::gpu::Cfg().dumpFrames = argv[++i];
+        else if (!std::strcmp(argv[i], "--trace-kernel-handle") && i + 1 < argc) traceKernelHandle = (uint32_t)std::strtoul(argv[++i], nullptr, 0);
         else if (!std::strcmp(argv[i], "--fb-frames") && i + 1 < argc) rt::gpu::Cfg().fbFrames = argv[++i];
         else if (!std::strcmp(argv[i], "--selftest-pm4")) return rt::gpu::Pm4SelfTest();
         else if (!std::strcmp(argv[i], "--selftest-cpu")) {   // --selftest-cpu [N=10000] [semilla=1]
@@ -309,6 +330,11 @@ int main(int argc, char** argv) {
         }
     }
     if (!log.Open(logPath)) { std::fprintf(stderr, "no se puede abrir %s\n", logPath.c_str()); return 2; }
+    g_userdataOverride = userdataOverride;
+    rt::SetSyncTraceHandle(traceKernelHandle);
+    rt::ConfigureInputStartInjection(inputStartAfterCalls, inputStartDurationCalls);
+    rt::ConfigureXamUser0SignedIn(testUser0SignedIn, testUser0SignedInAfterCalls);
+    rt::gpu::d3d::SetDumpHlslHash(dumpHlslHash);
 
     if (inputSelfTest) {
         if (!rt::GuestMemory::Init()) { std::printf("input-selftest: GuestMemory::Init fallo\n"); return 2; }
@@ -428,6 +454,7 @@ int main(int argc, char** argv) {
         log.Printf("TIMEOUT %us: el hilo principal sigue en ejecucion; ultimo import=%s", timeoutSec, rt::ImportLog::LastImport());
         rt::perf::Stop();
         rt::GuestThread::DumpAllThreads();
+        rt::DumpSyncTrace();
         rt::BinkProbeReport();
         rt::AudioSummary();
         if (rt::gpu::Cfg().shaderScan) rt::gpu::ScanShaderContainers("fin (timeout)");
@@ -444,6 +471,7 @@ int main(int argc, char** argv) {
     rt::gpu::Stop();
     rt::audio::StopXmaWorker();
     rt::gpu::Summary();
+    rt::DumpSyncTrace();
     log.Summary();
     return th->ExitCode();
 }

@@ -36,6 +36,7 @@ namespace rt::gpu::d3d {
 extern unsigned g_kickDraws, g_kickResolveDraws;
 extern bool g_asyncResolveWriter;
 extern bool g_resolveSync, g_noResolveShortcut, g_resolveNoDse, g_resolveSlowPath, g_resolveVerify, g_verifyShortcut;
+void SetDumpHlslHash(uint64_t hash);
 
 using Microsoft::WRL::ComPtr;
 namespace reg = xe::gpu::reg;
@@ -162,6 +163,8 @@ public:
     std::map<uint64_t, HostRT> colorRTs, depthRTs;
     std::vector<ResolveImage> resolveImages;
     uint64_t drawSerial = 0;
+    uint32_t debugDumpTextureBase = 0;
+    uint64_t debugDumpTextureFrame = 0, debugDumpTextureDraw = 0;
     uint64_t lastResolveNonzero = 0, lastResolvePixels = 0;
     uint32_t resolveDumps = 0, textureDumps = 0;
 
@@ -210,6 +213,7 @@ public:
     bool DoResolve(const DrawEvent& ev);
     // M8: resolve diferido y atajo GPU
     struct PendingResolve {
+        uint64_t frame = 0;
         uint32_t bpp = 4, bppLog2 = 2, rowPitch = 0, w = 0, h = 0;
         int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
         uint32_t destBase = 0, endian = 0, dpAligned = 0, sfmt = 0, dfmt = 0;

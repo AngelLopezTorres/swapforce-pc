@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 
@@ -6,6 +7,7 @@
 #include "import_log.h"
 
 using namespace rt;
+namespace rt { void ConfigureInputStartInjection(uint32_t afterCalls, uint32_t durationCalls); }
 
 namespace {
 constexpr uint32_t kDeviceNotConnected = 0x48F;
@@ -32,6 +34,9 @@ XInputApi& Api() {
     }, &a, nullptr);
     return a;
 }
+std::atomic<uint32_t> g_inputStateCalls{0};
+std::atomic<uint32_t> g_startInjectAfterCalls{0};
+std::atomic<uint32_t> g_startInjectDurationCalls{0};
 bool Key(int vk) { return (GetAsyncKeyState(vk)&0x8000)!=0; }
 State KeyboardState() {
     State s{};
@@ -59,10 +64,27 @@ void StorePad(uint8_t* base, uint32_t at, const Gamepad& p) {
 }
 }
 
+void rt::ConfigureInputStartInjection(uint32_t afterCalls, uint32_t durationCalls) {
+    g_inputStateCalls.store(0, std::memory_order_relaxed);
+    g_startInjectAfterCalls.store(afterCalls, std::memory_order_relaxed);
+    g_startInjectDurationCalls.store(durationCalls, std::memory_order_relaxed);
+    if (afterCalls && durationCalls)
+        ImportLog::Get().Printf("INPUT-INJECT configurado START despues_de=%u llamadas duracion=%u llamadas", afterCalls, durationCalls);
+}
+
 GUEST_IMPORT_IMPL(XamInputGetState) {
     ImportScope sc("XamInputGetState",ctx,base);
     State s{}; uint32_t user=ctx.r3.u32&0xFF;
     DWORD rc=ReadState(user,s);
+    if (!rc && user == 0) {
+        const uint32_t call = g_inputStateCalls.fetch_add(1, std::memory_order_relaxed) + 1;
+        const uint32_t after = g_startInjectAfterCalls.load(std::memory_order_relaxed);
+        const uint32_t duration = g_startInjectDurationCalls.load(std::memory_order_relaxed);
+        if (after && duration && call >= after && call - after < duration) {
+            s.pad.buttons |= kStart;
+            if (call == after) ImportLog::Get().Printf("INPUT-INJECT START activo desde llamada=%u", call);
+        }
+    }
     if (!rc && ctx.r5.u32) { P32(base,ctx.r5.u32,s.packet); StorePad(base,ctx.r5.u32+4,s.pad); }
     if (!rc) ImportLog::Get().Printf("INPUT user=%u buttons=0x%04X",user,s.pad.buttons);
     SetRet(ctx,rc);

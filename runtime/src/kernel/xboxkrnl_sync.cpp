@@ -1,6 +1,7 @@
 // Sincronizacion: eventos, semaforos, mutantes, esperas, secciones criticas, spinlocks, tiempo.
 // Semantica: Windows (NT) documentada en Microsoft Learn; layout guest de Xbox 360 segun Xenia.
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -11,10 +12,52 @@
 #include "guest_thread.h"
 #include "import_log.h"
 #include "kobject.h"
+#include "xboxkrnl_sync.h"
 
 using namespace rt;
 
 namespace {
+std::atomic<uint32_t> g_syncTraceHandle{0};
+std::atomic<uint64_t> g_traceWaitCount{0}, g_traceReleaseCount{0}, g_traceOtherCount{0};
+std::atomic<uint32_t> g_traceLastWaitTid{0}, g_traceLastWaitLr{0};
+std::atomic<uint32_t> g_traceLastReleaseTid{0}, g_traceLastReleaseLr{0};
+
+void TraceSync(const char* op, uint32_t handle, uint32_t arg0, uint32_t arg1, const PPCContext& ctx, std::atomic<uint64_t>& count) {
+    if (!handle || handle != g_syncTraceHandle.load(std::memory_order_relaxed)) return;
+    uint64_t n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+    GuestThread* t = GuestThread::Current();
+    if (std::strcmp(op, "wait.begin") == 0) {
+        g_traceLastWaitTid = t ? t->id : 0;
+        g_traceLastWaitLr = (uint32_t)ctx.lr;
+    } else if (std::strcmp(op, "release") == 0) {
+        g_traceLastReleaseTid = t ? t->id : 0;
+        g_traceLastReleaseLr = (uint32_t)ctx.lr;
+    }
+    if (n <= 24 || (n % 1024) == 0) {
+        char chain[96] = "";
+        size_t used = 0;
+        uint8_t* base = GuestMemory::Base();
+        uint32_t sp = ctx.r1.u32;
+        for (int d = 0; base && d < 4 && sp >= 0x70000000 && sp < 0x80000000; ++d) {
+            uint32_t next = G32(base, sp);
+            if (next <= sp || next >= 0x80000000 || next - sp > 0x100000) break;
+            uint32_t lr = G32(base, next - 8);
+            used += std::snprintf(chain + used, sizeof(chain) - used, "%s%08X", d ? "," : "", lr);
+            sp = next;
+            if (used + 12 >= sizeof(chain)) break;
+        }
+        ImportLog::Get().Printf("SYNC-TRACE n=%llu op=%s handle=%08X guest_tid=%u lr=%08X arg0=%08X arg1=%08X caller_chain=%s",
+                                (unsigned long long)n, op, handle, t ? t->id : 0, (uint32_t)ctx.lr, arg0, arg1, chain);
+    }
+}
+
+uint32_t TraceHandleForObject(const std::shared_ptr<KObject>& o) {
+    uint32_t handle = g_syncTraceHandle.load(std::memory_order_relaxed);
+    if (!handle || !o) return 0;
+    auto expected = HandleTable::Get().Lookup(handle);
+    return expected && expected.get() == o.get() ? handle : 0;
+}
+
 // Marca RAII de espera del hilo guest actual (volcado de hilos, M0).
 struct WaitMark {
     GuestThread* t;
@@ -88,6 +131,23 @@ std::shared_ptr<KObject> NewEvent(bool manual, bool initial) {
 
 } // namespace
 
+void rt::SetSyncTraceHandle(uint32_t handle) {
+    g_syncTraceHandle = handle;
+    if (handle) ImportLog::Get().Printf("SYNC-TRACE configurado handle=%08X", handle);
+}
+
+void rt::DumpSyncTrace() {
+    uint32_t handle = g_syncTraceHandle.load(std::memory_order_relaxed);
+    if (!handle) return;
+    ImportLog::Get().Printf("SYNC-TRACE resumen handle=%08X waits=%llu releases=%llu otros=%llu last_wait_tid=%u lr=%08X last_release_tid=%u lr=%08X",
+                            handle,
+                            (unsigned long long)g_traceWaitCount.load(),
+                            (unsigned long long)g_traceReleaseCount.load(),
+                            (unsigned long long)g_traceOtherCount.load(),
+                            g_traceLastWaitTid.load(), g_traceLastWaitLr.load(),
+                            g_traceLastReleaseTid.load(), g_traceLastReleaseLr.load());
+}
+
 // ---------------- Eventos ----------------
 GUEST_IMPORT_IMPL(NtCreateEvent) {
     ImportScope sc("NtCreateEvent", ctx, base);
@@ -96,6 +156,7 @@ GUEST_IMPORT_IMPL(NtCreateEvent) {
     if (!o->host) { SetRet(ctx, 0xC0000001); return; }
     uint32_t h = HandleTable::Get().Add(o);
     ImportLog::Get().Printf("  NtCreateEvent handle=%08X manual=%d initial=%u", h, (int)o->manualReset, ctx.r6.u32);
+    TraceSync("create.event", h, ctx.r5.u32 == 0, ctx.r6.u32, ctx, g_traceOtherCount);
     if (ctx.r3.u32) P32(base, ctx.r3.u32, h);
     SetRet(ctx, ST_SUCCESS);
 }
@@ -104,6 +165,7 @@ GUEST_IMPORT_IMPL(NtSetEvent) {
     ImportScope sc("NtSetEvent", ctx, base);
     auto o = ObjFromHandle(ctx.r3.u32);
     if (!o || o->type != KType::Event) { SetRet(ctx, ST_INVALID_HANDLE); return; }
+    TraceSync("set.event", ctx.r3.u32, 0, 0, ctx, g_traceOtherCount);
     uint32_t prev = WaitForSingleObject(o->host, 0) == WAIT_OBJECT_0 ? 1 : 0;
     if (prev && !o->manualReset) SetEvent(o->host); // la sonda consumio la senal de un evento auto
     SetEvent(o->host);
@@ -115,6 +177,7 @@ GUEST_IMPORT_IMPL(NtClearEvent) {
     ImportScope sc("NtClearEvent", ctx, base);
     auto o = ObjFromHandle(ctx.r3.u32);
     if (!o || o->type != KType::Event) { SetRet(ctx, ST_INVALID_HANDLE); return; }
+    TraceSync("clear.event", ctx.r3.u32, 0, 0, ctx, g_traceOtherCount);
     ResetEvent(o->host);
     SetRet(ctx, ST_SUCCESS);
 }
@@ -155,6 +218,7 @@ GUEST_IMPORT_IMPL(NtCreateSemaphore) {
     if (!o->host) { SetRet(ctx, ST_INVALID_PARAMETER); return; }
     uint32_t h = HandleTable::Get().Add(o);
     ImportLog::Get().Printf("  NtCreateSemaphore handle=%08X initial=%u max=%u", h, ctx.r5.u32, ctx.r6.u32);
+    TraceSync("create.semaphore", h, ctx.r5.u32, ctx.r6.u32, ctx, g_traceOtherCount);
     if (ctx.r3.u32) P32(base, ctx.r3.u32, h);
     SetRet(ctx, ST_SUCCESS);
 }
@@ -164,7 +228,11 @@ GUEST_IMPORT_IMPL(NtReleaseSemaphore) {
     auto o = ObjFromHandle(ctx.r3.u32);
     if (!o || o->type != KType::Semaphore) { SetRet(ctx, ST_INVALID_HANDLE); return; }
     LONG prev = 0;
-    if (!ReleaseSemaphore(o->host, (LONG)ctx.r4.u32, &prev)) { SetRet(ctx, 0xC0000047); return; } // STATUS_SEMAPHORE_LIMIT_EXCEEDED
+    if (!ReleaseSemaphore(o->host, (LONG)ctx.r4.u32, &prev)) {
+        TraceSync("release.failed", ctx.r3.u32, ctx.r4.u32, 0xC0000047, ctx, g_traceReleaseCount);
+        SetRet(ctx, 0xC0000047); return;
+    } // STATUS_SEMAPHORE_LIMIT_EXCEEDED
+    TraceSync("release", ctx.r3.u32, ctx.r4.u32, (uint32_t)prev, ctx, g_traceReleaseCount);
     if (ctx.r5.u32) P32(base, ctx.r5.u32, (uint32_t)prev);
     SetRet(ctx, ST_SUCCESS);
 }
@@ -196,7 +264,11 @@ GUEST_IMPORT_IMPL(NtWaitForSingleObjectEx) {
     // (handle, WaitMode, Alertable, Timeout*)
     auto o = ObjFromHandle(ctx.r3.u32);
     WaitMark wm(1, ctx.r3.u32, o ? (uint32_t)o->type : 99, 1);
-    SetRet(ctx, WaitOne(o, TimeoutMs(base, ctx.r6.u32)));
+    uint32_t timeout = TimeoutMs(base, ctx.r6.u32);
+    TraceSync("wait.begin", ctx.r3.u32, timeout, o ? (uint32_t)o->type : 99, ctx, g_traceWaitCount);
+    uint32_t result = WaitOne(o, timeout);
+    TraceSync("wait.end", ctx.r3.u32, result, timeout, ctx, g_traceOtherCount);
+    SetRet(ctx, result);
 }
 
 GUEST_IMPORT_IMPL(KeWaitForSingleObject) {
@@ -204,7 +276,11 @@ GUEST_IMPORT_IMPL(KeWaitForSingleObject) {
     // (objeto guest, WaitReason, WaitMode, Alertable, Timeout*)
     auto o = HandleTable::Get().FromNative(ctx.r3.u32);
     WaitMark wm(2, ctx.r3.u32, o ? (uint32_t)o->type : 99, 1);
-    SetRet(ctx, WaitOne(o, TimeoutMs(base, ctx.r7.u32)));
+    uint32_t timeout = TimeoutMs(base, ctx.r7.u32), h = TraceHandleForObject(o);
+    TraceSync("ke.wait.begin", h, timeout, o ? (uint32_t)o->type : 99, ctx, g_traceWaitCount);
+    uint32_t result = WaitOne(o, timeout);
+    TraceSync("ke.wait.end", h, result, timeout, ctx, g_traceOtherCount);
+    SetRet(ctx, result);
 }
 
 GUEST_IMPORT_IMPL(KeWaitForMultipleObjects) {

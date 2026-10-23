@@ -7,8 +7,32 @@
 
 #include "config.h"
 #include "d3d12_impl.h"
+#include "fb_decode.h"
 
 namespace rt::gpu::d3d {
+
+static std::atomic<uint64_t> g_dumpHlslHash{0};
+static std::atomic<uint64_t> g_debugStopFrame{0};
+
+void SetDumpHlslHash(uint64_t hash) { g_dumpHlslHash.store(hash); }
+
+static float HalfToFloat(uint16_t h) {
+    const uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t exp = (h >> 10) & 0x1Fu, mant = h & 0x03FFu, bits;
+    if (!exp) {
+        if (!mant) bits = sign;
+        else {
+            int shift = 0;
+            while (!(mant & 0x0400u)) { mant <<= 1; ++shift; }
+            mant &= 0x03FFu;
+            bits = sign | ((uint32_t)(127 - 14 - shift) << 23) | (mant << 13);
+        }
+    } else if (exp == 0x1Fu) bits = sign | 0x7F800000u | (mant << 13);
+    else bits = sign | ((exp + 112u) << 23) | (mant << 13);
+    float value;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
 
 // ---- constantes del shader (debe coincidir con el cbuffer XeConsts de ucode_hlsl.cpp) ----
 struct XeConsts {
@@ -70,20 +94,46 @@ static void WriteAll(const std::string& p, const std::string& d) {
 }
 
 const D3D12Backend::DxilBlob* D3D12Backend::GetDxil(const ShaderInfo& si, int paramGenPos) {
+    uint64_t requestedHash = si.hash;
+    const bool dumpHlsl = requestedHash != 0 && g_dumpHlslHash.compare_exchange_strong(requestedHash, 0);
+    HlslResult dumpedHlsl;
+    bool translatedForDump = false;
+    if (dumpHlsl) {
+        HlslOptions dumpOptions; dumpOptions.paramGenPos = paramGenPos;
+        dumpedHlsl = TranslateToHlsl(si, dumpOptions);
+        translatedForDump = true;
+        if (dumpedHlsl.ok) {
+            const std::string hlslDir = GetPaths().userdataDir + "\\shaders\\hlsl";
+            CreateDirectoryA(GetPaths().userdataDir.c_str(), nullptr);
+            CreateDirectoryA((GetPaths().userdataDir + "\\shaders").c_str(), nullptr);
+            CreateDirectoryA(hlslDir.c_str(), nullptr);
+            char hlslName[128];
+            std::snprintf(hlslName, sizeof(hlslName), "\\%016llX_pg%d_%s.hlsl",
+                          (unsigned long long)si.hash, paramGenPos, si.vertex ? "vs" : "ps");
+            const std::string hlslPath = hlslDir + hlslName;
+            WriteAll(hlslPath, dumpedHlsl.hlsl);
+            ImportLog::Get().Printf("D3D12 HLSL_DUMP %016llX %s ruta=%s bytes=%u",
+                                    (unsigned long long)si.hash, si.vertex ? "vs" : "ps", hlslPath.c_str(),
+                                    (unsigned)dumpedHlsl.hlsl.size());
+        } else {
+            ImportLog::Get().Printf("D3D12 HLSL_DUMP_FAIL %016llX %s traduccion: %s",
+                                    (unsigned long long)si.hash, si.vertex ? "vs" : "ps", dumpedHlsl.error.c_str());
+        }
+    }
     uint64_t key = si.hash ^ ((uint64_t)(paramGenPos + 1) * 0x9E3779B97F4A7C15ull);
     auto it = dxilCache.find(key);
     if (it != dxilCache.end()) return it->second.ok ? &it->second : nullptr;
     DxilBlob& b = dxilCache[key];
-    std::string dir = GetPaths().runtimeDir + "\\userdata\\shaders\\dxil";
-    CreateDirectoryA((GetPaths().runtimeDir + "\\userdata").c_str(), nullptr);
-    CreateDirectoryA((GetPaths().runtimeDir + "\\userdata\\shaders").c_str(), nullptr);
+    std::string dir = GetPaths().userdataDir + "\\shaders\\dxil";
+    CreateDirectoryA(GetPaths().userdataDir.c_str(), nullptr);
+    CreateDirectoryA((GetPaths().userdataDir + "\\shaders").c_str(), nullptr);
     CreateDirectoryA(dir.c_str(), nullptr);
     char name[160];
     std::snprintf(name, sizeof(name), "\\%016llX_pg%d_%s_%s.dxil", (unsigned long long)si.hash, paramGenPos, kTranslatorVersion, si.vertex ? "vs" : "ps");
     std::string path = dir + name;
     if (ReadAll(path, b.data)) { b.ok = true; return &b; }
     HlslOptions ho; ho.paramGenPos = paramGenPos;
-    HlslResult hr = TranslateToHlsl(si, ho);
+    HlslResult hr = translatedForDump ? std::move(dumpedHlsl) : TranslateToHlsl(si, ho);
     if (!hr.ok) { b.err = hr.error; ImportLog::Get().Printf("D3D12 SHADER_FAIL %016llX %s traduccion: %s", (unsigned long long)si.hash, si.vertex ? "vs" : "ps", hr.error.c_str()); return nullptr; }
     std::string err;
     if (!CompileHlslToDxil(hr.hlsl, si.vertex, b.data, err)) {
@@ -321,6 +371,7 @@ bool D3D12Backend::DoDraw(const DrawEvent& ev, const ShaderInfo* vs, const Shade
         if (ok) { ++resolves; ++fResolve; } else Note("OMISION resolve: fallo (ver notas previas)");
         return ok;
     }
+    if (g_debugStopFrame.load(std::memory_order_relaxed) == rt::gpu::FrameCount() + 1) return true;
     if (mode != xenos::EdramMode::kColorDepth && mode != xenos::EdramMode::kDepthOnly) { Note("OMISION draw con edram_mode=kNoOperation"); return false; }
     if (!vs) { Note("OMISION draw sin vertex shader cargado"); return false; }
     bool colorMode = mode == xenos::EdramMode::kColorDepth;
@@ -423,7 +474,9 @@ bool D3D12Backend::DoDraw(const DrawEvent& ev, const ShaderInfo* vs, const Shade
     c->ndcScale[3] = 1.0f; c->ndcOffset[3] = 0.0f;
     if (const char* dbg = std::getenv("XE_DBG_PS")) {   // depuracion: constantes y primeros bytes de textura para un PS (hash hexadecimal)
         static int dbgCount = 0;
-        if (ps && ps->hash == std::strtoull(dbg, nullptr, 16) && dbgCount < 3) {
+        const uint64_t debugFrame = rt::gpu::Cfg().stateLogFrame;
+        const bool debugFrameMatch = !debugFrame || rt::gpu::FrameCount() + 1 == debugFrame;
+        if (ps && ps->hash == std::strtoull(dbg, nullptr, 16) && debugFrameMatch && dbgCount < 3) {
             ++dbgCount;
             ImportLog::Get().Printf("DBG PS %016llX draw=%llu c253=(%g,%g,%g,%g) c254=(%g,%g,%g,%g) c255=(%g,%g,%g,%g)", (unsigned long long)ps->hash, (unsigned long long)drawSerial,
                                     RF(0x4400 + 253 * 4), RF(0x4400 + 253 * 4 + 1), RF(0x4400 + 253 * 4 + 2), RF(0x4400 + 253 * 4 + 3),
@@ -436,6 +489,55 @@ bool D3D12Backend::DoDraw(const DrawEvent& ev, const ShaderInfo* vs, const Shade
                 if (m) for (int i = 0; i < 32; ++i) std::snprintf(hex + i * 3, 4, "%02X ", m[i]);
                 ImportLog::Get().Printf("DBG tex%u dw0=%08X dw1=%08X dw2=%08X dw3=%08X dw4=%08X dw5=%08X mem[0..31]=%s", t, RV(0x4800 + t * 6), w1, RV(0x4800 + t * 6 + 2), w3,
                                         RV(0x4800 + t * 6 + 4), RV(0x4800 + t * 6 + 5), hex);
+            }
+            std::vector<uint32_t> vertexIndices;
+            if (ev.src == 0 && ev.nIdx && ev.nIdx <= 32) {
+                std::string indexList;
+                const uint32_t indexBytes = ev.indexSize ? 4u : 2u;
+                const uint32_t indexEndian = ev.dmaSize >> 30;
+                for (uint32_t i = 0; i < ev.nIdx; ++i) {
+                    const uint32_t a = (ev.dmaBase + i * indexBytes) & 0x1FFFFFFFu;
+                    const uint8_t* p = PhysHost(a & 0x1FFFFFFCu, 4);
+                    if (!p) break;
+                    uint32_t word; std::memcpy(&word, p, sizeof(word));
+                    word = GpuSwap32(word, indexEndian);
+                    const uint32_t index = ev.indexSize ? word : ((a & 2u) ? (word >> 16) : (word & 0xFFFFu));
+                    vertexIndices.push_back(index);
+                    char b[24]; std::snprintf(b, sizeof(b), "%s%u", i ? "," : "", index); indexList += b;
+                }
+                ImportLog::Get().Printf("DBG IDX %016llX draw=%llu src=%u n=%u indexSize=%u dmaBase=%08X dmaSize=%08X indexes=%s",
+                                        (unsigned long long)ps->hash, (unsigned long long)drawSerial, ev.src, ev.nIdx,
+                                        ev.indexSize, ev.dmaBase, ev.dmaSize, indexList.c_str());
+            }
+            if (vs && !vertexIndices.empty()) {
+                for (const VFetchUse& vf : vs->vfetch) {
+                    if (vf.constIdx != 95) continue;
+                    const uint32_t d0 = RV(0x4800 + (vf.constIdx / 3) * 6 + (vf.constIdx % 3) * 2);
+                    const uint32_t d1 = RV(0x4800 + (vf.constIdx / 3) * 6 + (vf.constIdx % 3) * 2 + 1);
+                    const uint32_t strideBytes = vf.stride * 4;
+                    std::set<uint32_t> seen;
+                    for (uint32_t index : vertexIndices) {
+                        if (!seen.insert(index).second || seen.size() > 4) continue;
+                        const uint32_t address = ((d0 & 0xFFFFFFFCu) + index * strideBytes) & 0x1FFFFFFFu;
+                        const uint8_t* p = PhysHost(address, strideBytes);
+                        if (!p) continue;
+                        std::string raw;
+                        for (uint32_t i = 0; i < strideBytes; ++i) {
+                            char b[4]; std::snprintf(b, sizeof(b), "%s%02X", i ? " " : "", p[i]); raw += b;
+                        }
+                        float pos[3]{};
+                        for (uint32_t c = 0; c < 3; ++c) {
+                            uint32_t word; std::memcpy(&word, p + c * 4, sizeof(word));
+                            word = GpuSwap32(word, d1 & 3u); std::memcpy(&pos[c], &word, sizeof(word));
+                        }
+                        uint32_t uvWord; std::memcpy(&uvWord, p + 16, sizeof(uvWord)); uvWord = GpuSwap32(uvWord, d1 & 3u);
+                        const float u = HalfToFloat((uint16_t)(uvWord >> 16)), v = HalfToFloat((uint16_t)uvWord);
+                        ImportLog::Get().Printf("DBG VTX %016llX draw=%llu fetch=95 index=%u address=%08X endian=%u stride=%u pos=(%g,%g,%g) uv=(%g,%g) raw=%s",
+                                                (unsigned long long)ps->hash, (unsigned long long)drawSerial, index, address,
+                                                d1 & 3u, vf.stride, pos[0], pos[1], pos[2], u, v, raw.c_str());
+                    }
+                    break;
+                }
             }
         }
     }
@@ -464,9 +566,21 @@ bool D3D12Backend::DoDraw(const DrawEvent& ev, const ShaderInfo* vs, const Shade
     // M8: las texturas se obtienen antes de reservar descriptores: GetTexture puede vaciar la lista (FlushAndWait reinicia gpuSrvNext)
     uint32_t texMask = vs->tfetchMask | (ps ? ps->tfetchMask : 0);
     HostTexture* texs[32] = {};
+    debugDumpTextureBase = 0; debugDumpTextureFrame = 0; debugDumpTextureDraw = 0;
+    if (const char* dbgPs = std::getenv("XE_DBG_PS")) {
+        if (const char* dbgBase = std::getenv("XE_DBG_TEXTURE_BASE")) {
+            const uint64_t debugFrame = rt::gpu::Cfg().stateLogFrame;
+            if (ps && ps->hash == std::strtoull(dbgPs, nullptr, 16) && (!debugFrame || rt::gpu::FrameCount() + 1 == debugFrame)) {
+                debugDumpTextureBase = (uint32_t)std::strtoul(dbgBase, nullptr, 16);
+                debugDumpTextureFrame = rt::gpu::FrameCount() + 1;
+                debugDumpTextureDraw = drawSerial;
+            }
+        }
+    }
     for (uint32_t i = 0; i < 32; ++i) {
         if (texMask & (1u << i)) texs[i] = GetTexture(i, (vs->tfetchMask & (1u << i)) != 0 && !(ps && (ps->tfetchMask & (1u << i))));
     }
+    debugDumpTextureBase = 0; debugDumpTextureFrame = 0; debugDumpTextureDraw = 0;
     uint32_t base = AllocGpuSrv(96);
     D3D12_CPU_DESCRIPTOR_HANDLE cpuStart = cpuSrvHeap->GetCPUDescriptorHandleForHeapStart();
     D3D12_CPU_DESCRIPTOR_HANDLE dstStart = gpuSrvHeap->GetCPUDescriptorHandleForHeapStart();
@@ -541,6 +655,15 @@ bool D3D12Backend::DoDraw(const DrawEvent& ev, const ShaderInfo* vs, const Shade
     cl->OMSetBlendFactor(bf);
     cl->OMSetStencilRef(R<reg::RB_STENCILREFMASK>().stencilref);
     cl->DrawInstanced(count, 1, 0, 0);
+    if (const char* stopDbg = std::getenv("XE_DBG_STOP_AFTER_PS")) {
+        const uint64_t debugFrame = rt::gpu::Cfg().stateLogFrame;
+        if (ps && ps->hash == std::strtoull(stopDbg, nullptr, 16) && (!debugFrame || rt::gpu::FrameCount() + 1 == debugFrame)) {
+            g_debugStopFrame.store(rt::gpu::FrameCount() + 1, std::memory_order_relaxed);
+            ImportLog::Get().Printf("DBG STOP_AFTER_PS hash=%016llX draw=%llu frame=%llu",
+                                    (unsigned long long)ps->hash, (unsigned long long)drawSerial,
+                                    (unsigned long long)(rt::gpu::FrameCount() + 1));
+        }
+    }
     return true;
 }
 

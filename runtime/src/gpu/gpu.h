@@ -13,6 +13,7 @@ struct Config {
     uint32_t logPerFrame = 48;     // lineas de paquetes por fotograma en gpu.log (los DRAWSTATE y resumenes no tienen limite)
     std::string logPath = "gpu.log";
     bool stateLog = false;         // --gpu-statelog: una linea DRAWSTATE por draw en gpu.log
+    uint64_t stateLogFrame = 0;     // --gpu-statelog-frame N: estado detallado solo en el fotograma N
     bool shaderScan = false;       // M8: --shader-scan (barrido de contenedores de shaders a 10 s, 30 s y al final)
     std::string framesDir;         // M8: --frames-dir
     bool hist = false;             // M8: --gpu-hist (o --gpu-statelog): histogramas H0 por draw (TEXFMT/VTXFMT/...); antes siempre activos
@@ -24,6 +25,7 @@ struct Config {
     bool clearTest = false;        // --d3d-clear-test: color fijo por fotograma (prueba H1)
     bool d3dStats = false;         // --d3d-stats: nonblack_px/hash en cada fotograma
     uint32_t dumpResolves = 0;     // --dump-resolves K
+    uint64_t dumpResolveFrame = 0; // --dump-resolves-frame N: resolves de color del fotograma N
     uint32_t dumpTextures = 0;     // --dump-textures K
     bool binkTrace = false;        // --bink-trace: BINKPLANE por draw del PS de composicion Bink (M0)
     std::string dumpFrames;        // --dump-frames N[,M..]: PNG del fotograma renderizado por el backend

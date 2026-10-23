@@ -224,16 +224,26 @@ bool D3D12Backend::DoResolve(const DrawEvent& ev) {
     auto dpitch = R<reg::RB_COPY_DEST_PITCH>();
     uint32_t destBase = RV(0x2319);
     HostRT* src = nullptr;
+    uint32_t srcBase = 0;
     uint32_t needH = ((uint32_t)y1 + 31u) & ~31u;
     if (!isDepth) {
         auto ci = R<reg::RB_COLOR_INFO>(); ci.value = RV(srcSel == 0 ? 0x2001 : 0x2003 + (srcSel - 1));
-        src = GetColorRT(ci.color_base | (ci.color_base_bit_11 << 11), surf.surface_pitch, (uint32_t)ci.color_format, needH);
+        srcBase = ci.color_base | (ci.color_base_bit_11 << 11);
+        src = GetColorRT(srcBase, surf.surface_pitch, (uint32_t)ci.color_format, needH);
         if (!src) { Note("OMISION resolve: sin render target de color de origen"); return false; }
     }
     bool wrote = false;
     if (src) {
         uint32_t dfmt = (uint32_t)dinfo.copy_dest_format;
         uint32_t sfmt = src->xenosFormat;
+        if (Cfg().dumpResolveFrame && FrameCount() + 1 == Cfg().dumpResolveFrame) {
+            uint32_t di = RV(0x2002);
+            ImportLog::Get().Printf("D3D12 RESOLVEFRAME frame=%llu draw=%llu srcsel=%u surface=%08X color_info=%08X depth_info=%08X copy_control=%08X copy_dest=%08X dest_pitch=%08X clear_value=%08X src_base=%08X srcfmt=%u dst=%08X dstfmt=%u rect=%d,%d-%d,%d msaa=%u clear=%u/%u",
+                                    (unsigned long long)(FrameCount() + 1), (unsigned long long)drawSerial, srcSel, RV(0x2000), RV(srcSel == 0 ? 0x2001 : 0x2003 + (srcSel - 1)), di,
+                                    RV(0x2318), RV(0x231A), RV(0x231B), RV(0x231D), srcBase,
+                                    sfmt, destBase, dfmt, x0, y0, x1, y1, (RV(0x2000) >> 16) & 3,
+                                    (uint32_t)cc.color_clear_enable, (uint32_t)cc.depth_clear_enable);
+        }
         // formatos de destino admitidos en la v1 (combinaciones bit a bit equivalentes, ver IsColorResolveFormatBitwiseEquivalent de xenos.h)
         bool ok32 = (sfmt == 0 || sfmt == 1) && (dfmt == 6 || dfmt == 14 || dfmt == 50);
         bool ok1010 = (sfmt == 2 || sfmt == 10) && (dfmt == 7 || dfmt == 54);
@@ -244,6 +254,7 @@ bool D3D12Backend::DoResolve(const DrawEvent& ev) {
             Note("SIMPLIFY resolve de formato RT=" + std::to_string(sfmt) + " a formato de destino=" + std::to_string(dfmt) + " no implementado: destino sin escribir");
         } else {
             PendingResolve pr;
+            pr.frame = FrameCount() + 1;
             pr.bpp = BytesPerPixel(src->format);
             pr.bppLog2 = pr.bpp == 8 ? 3 : 2;
             pr.rowPitch = (w * pr.bpp + 255) & ~255u;
@@ -418,7 +429,8 @@ void D3D12Backend::WriteResolve(const PendingResolve& pr, const uint8_t* srcp) {
                                                                        same ? "IGUAL" : "DISTINTO", (unsigned long long)vOk, (unsigned long long)vBad);
     }
     static uint64_t statN = 0;
-    bool wantStat = opt.stats || resolveDumps < opt.dumpResolves || statN < 12 || ((statN + 1) % 200) == 0;   // solo si se registran
+    const bool targetedDump = Cfg().dumpResolveFrame && pr.frame == Cfg().dumpResolveFrame;
+    bool wantStat = opt.stats || resolveDumps < opt.dumpResolves || targetedDump || statN < 12 || ((statN + 1) % 200) == 0;   // solo si se registran
     ++statN;
     if (bpp == 4 && wantStat) {   // estadisticas del contenido resuelto (RGB != 0) y volcado opcional
         uint64_t nz = 0;
@@ -427,14 +439,18 @@ void D3D12Backend::WriteResolve(const PendingResolve& pr, const uint8_t* srcp) {
             for (uint32_t x = 0; x < w; ++x) if (row[x] & 0x00FFFFFFu) ++nz;
         }
         lastResolveNonzero = nz; lastResolvePixels = (uint64_t)w * h;
-        if (resolveDumps < opt.dumpResolves && (pr.sfmt == 0 || pr.sfmt == 1)) {
+        if ((targetedDump || (!Cfg().dumpResolveFrame && resolveDumps < opt.dumpResolves)) && (pr.sfmt == 0 || pr.sfmt == 1)) {
             std::vector<uint8_t> img((size_t)w * h * 4);
             for (uint32_t y = 0; y < h; ++y) std::memcpy(&img[(size_t)y * w * 4], srcp + (size_t)y * rowPitch, (size_t)w * 4);
+            ImageStats imageStats = ComputeStats(w, h, img.data(), w * 4);
             char nm[96];
-            std::snprintf(nm, sizeof(nm), "\\resolve_%03u_%08X_%ux%u.png", resolveDumps, destBase, w, h);
+            std::snprintf(nm, sizeof(nm), "\\resolve_f%05llu_%03u_%08X_%ux%u.png", (unsigned long long)pr.frame, resolveDumps, destBase, w, h);
             std::string path = rt::gpu::FramesDir() + nm;
             bool okp = WritePngRGBA(path, w, h, img.data(), w * 4);
-            ImportLog::Get().Printf("D3D12 volcado de resolve -> %s %s nonzero=%llu/%llu", path.c_str(), okp ? "OK" : "FALLO", (unsigned long long)nz, (unsigned long long)((uint64_t)w * h));
+            ImportLog::Get().Printf("D3D12 volcado de resolve frame=%llu -> %s %s nonzero=%llu/%llu hash=%016llX RGB=%u-%u,%u-%u,%u-%u",
+                                    (unsigned long long)pr.frame, path.c_str(), okp ? "OK" : "FALLO", (unsigned long long)nz,
+                                    (unsigned long long)((uint64_t)w * h), (unsigned long long)imageStats.hash,
+                                    imageStats.minR, imageStats.maxR, imageStats.minG, imageStats.maxG, imageStats.minB, imageStats.maxB);
             ++resolveDumps;
         }
     }

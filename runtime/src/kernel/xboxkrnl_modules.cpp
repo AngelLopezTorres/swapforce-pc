@@ -1,5 +1,6 @@
 // Modulos: XexLoadImage / XexGetModuleHandle / XexGetProcedureAddress / XexUnloadImage (solo modulos del sistema).
 #include <cctype>
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -12,6 +13,7 @@
 #include "../hid/portal.h"
 
 using namespace rt;
+namespace rt { void ConfigureXamUser0SignedIn(bool enabled, uint32_t afterCalls); }
 
 namespace {
 
@@ -22,6 +24,8 @@ constexpr uint32_t kStatusDriverEntryPointNotFound = 0xC0000225;
 std::mutex g_moduleMu;
 std::unordered_map<uint32_t, std::string> g_moduleHandles;
 std::mutex g_xamExportsMu;
+std::atomic<bool> g_xamUser0SignedIn{false};
+std::atomic<uint32_t> g_xamUser0SignedInAfterCalls{0}, g_xamUser0SigninCalls{0};
 
 void TrackModule(uint32_t handle, const std::string& name) {
     std::lock_guard<std::mutex> lock(g_moduleMu);
@@ -76,6 +80,13 @@ bool IsSystemModule(const std::string& n) {
 }
 
 } // namespace
+
+void rt::ConfigureXamUser0SignedIn(bool enabled, uint32_t afterCalls) {
+    g_xamUser0SigninCalls.store(0, std::memory_order_relaxed);
+    g_xamUser0SignedInAfterCalls.store(afterCalls, std::memory_order_relaxed);
+    g_xamUser0SignedIn.store(enabled, std::memory_order_relaxed);
+    if (enabled) ImportLog::Get().Printf("XAM-USER test: usuario 0 se reporta con estado 2 despues_de=%u llamadas", afterCalls);
+}
 
 GUEST_IMPORT_IMPL(XexLoadImage) {
     ImportScope sc("XexLoadImage", ctx, base);
@@ -141,4 +152,16 @@ GUEST_IMPORT_IMPL(XamNotifyCreateListener) {
 GUEST_IMPORT_IMPL(XNotifyGetNext) {
     ImportScope sc("XNotifyGetNext", ctx, base);
     SetRet(ctx, 0); // sin notificaciones pendientes
+}
+
+GUEST_IMPORT_IMPL(XamUserGetSigninState) {
+    ImportScope sc("XamUserGetSigninState", ctx, base);
+    const uint32_t user = ctx.r3.u32 & 0xFF;
+    const uint32_t call = user == 0 ? g_xamUser0SigninCalls.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
+    const uint32_t after = g_xamUser0SignedInAfterCalls.load(std::memory_order_relaxed);
+    const bool signedIn = user == 0 && g_xamUser0SignedIn.load(std::memory_order_relaxed) && (!after || call >= after);
+    const uint32_t state = signedIn ? 2 : 0;
+    if (after && call == after) ImportLog::Get().Printf("XAM-USER test: usuario 0 pasa a estado 2 en llamada=%u", call);
+    ImportLog::Get().Printf("  XamUserGetSigninState user=%u -> %u", user, state);
+    SetRet(ctx, state);
 }

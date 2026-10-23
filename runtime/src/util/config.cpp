@@ -51,10 +51,18 @@ bool LoadPaths(Paths& out, std::string* err) {
     out.xex = get("xex");
     out.cacheDir = get("cache");
     out.hddDir = get("hdd");
+    out.userdataDir = Canon(found + "\\userdata");
     g_paths = out;
     return true;
 }
 
 const Paths& GetPaths() { return g_paths; }
+
+void SetUserdataDir(const std::string& dir) {
+    if (dir.empty()) return;
+    g_paths.userdataDir = Canon(dir);
+    g_paths.cacheDir = Canon(g_paths.userdataDir + "\\cache");
+    g_paths.hddDir = Canon(g_paths.userdataDir + "\\hdd");
+}
 
 } // namespace rt

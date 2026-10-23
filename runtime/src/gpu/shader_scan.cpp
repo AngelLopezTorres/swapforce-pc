@@ -21,8 +21,8 @@ void ScanShaderContainers(const char* tag) {
     std::lock_guard<std::mutex> lk(mu);
     uint8_t* base = GuestMemory::Base();
     uint64_t found = 0, fresh = 0, inImage = 0;
-    std::string dir = GetPaths().runtimeDir + "\\userdata\\shaders";
-    CreateDirectoryA((GetPaths().runtimeDir + "\\userdata").c_str(), nullptr);
+    std::string dir = GetPaths().userdataDir + "\\shaders";
+    CreateDirectoryA(GetPaths().userdataDir.c_str(), nullptr);
     CreateDirectoryA(dir.c_str(), nullptr);
     uint64_t addr = 0;
     while (addr < 0x100000000ull) {

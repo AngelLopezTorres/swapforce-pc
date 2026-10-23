@@ -33,7 +33,7 @@ namespace rt::gpu {
 
 Config& Cfg() { static Config c; return c; }
 std::string FramesDir() {
-    std::string d = Cfg().framesDir.empty() ? GetPaths().runtimeDir + "\\userdata\\frames" : Cfg().framesDir;
+    std::string d = Cfg().framesDir.empty() ? GetPaths().userdataDir + "\\frames" : Cfg().framesDir;
     CreateDirectoryA(d.c_str(), nullptr);
     return d;
 }
@@ -210,8 +210,8 @@ struct CpHost : Pm4Host {
                 ImportLog::Get().Printf("SHADER-ANALYZE FALLO type=%s dwords=%u: %s", type == 0 ? "vs" : "ps", dwords, info->error.c_str());
             }
             it = g_shaderStore.emplace(h, info).first;
-            std::string dir = GetPaths().runtimeDir + "\\userdata\\shaders";
-            CreateDirectoryA((GetPaths().runtimeDir + "\\userdata").c_str(), nullptr);
+            std::string dir = GetPaths().userdataDir + "\\shaders";
+            CreateDirectoryA(GetPaths().userdataDir.c_str(), nullptr);
             CreateDirectoryA(dir.c_str(), nullptr);
             char name[64];
             std::snprintf(name, sizeof(name), "\\ucode_%016llX_%s.bin", (unsigned long long)h, type == 0 ? "vs" : "ps");
@@ -230,16 +230,44 @@ struct CpHost : Pm4Host {
         }
         g_dirtyTotal += nd; if (nd > g_dirtyMax) g_dirtyMax = nd;
         uint32_t surf = g_regs[0x2000], color = g_regs[0x2001], depth = g_regs[0x2002], mode = g_regs[0x2208], copy = g_regs[0x2318];
-        if (Cfg().stateLog) {
-            char b[320];
-            std::snprintf(b, sizeof(b), "DRAWSTATE frame=%llu vs=%016llX ps=%016llX surf=%08X color=%08X depth=%08X mode=%u copy=%08X prim=%u n=%u src=%u dirty=%llu",
-                          (unsigned long long)g_frames.load() + 1, (unsigned long long)active[0].hash, (unsigned long long)active[1].hash,
-                          surf, color, depth, mode & 7, copy, ev.prim, ev.nIdx, ev.src, (unsigned long long)nd);
+        const uint64_t frame = g_frames.load() + 1;
+        const bool stateLogThis = Cfg().stateLog && (!Cfg().stateLogFrame || frame == Cfg().stateLogFrame);
+        if (stateLogThis) {
+            char b[512];
+            std::snprintf(b, sizeof(b), "DRAWSTATE frame=%llu draw=%llu vs=%016llX ps=%016llX surf=%08X color=%08X depth=%08X mode=%u copy=%08X prim=%u n=%u src=%u dirty=%llu cm=%08X zc=%08X blend=%08X,%08X,%08X,%08X",
+                          (unsigned long long)frame, (unsigned long long)g_drawsSeen,
+                          (unsigned long long)active[0].hash, (unsigned long long)active[1].hash,
+                          surf, color, depth, mode & 7, copy, ev.prim, ev.nIdx, ev.src, (unsigned long long)nd,
+                          g_regs[0x2104], g_regs[0x2200], g_regs[0x2201], g_regs[0x2209], g_regs[0x220A], g_regs[0x220B]);
             GpuLogLine(b);
+            for (int stage = 0; stage < 2; ++stage) {
+                if (!active[stage].info) continue;
+                const ShaderInfo& si = *active[stage].info;
+                const char* stageName = stage == 0 ? "VS" : "PS";
+                std::set<uint32_t> seenVfetch;
+                for (const VFetchUse& v : si.vfetch) {
+                    if (!seenVfetch.insert(v.constIdx).second) continue;
+                    uint32_t grp = v.constIdx / 3, slot = v.constIdx % 3;
+                    char fetch[192];
+                    std::snprintf(fetch, sizeof(fetch), "DRAWFETCH frame=%llu draw=%llu stage=%s kind=vertex idx=%u words=%08X,%08X fmt=%u stride=%u",
+                                  (unsigned long long)frame, (unsigned long long)g_drawsSeen, stageName, v.constIdx,
+                                  g_regs[0x4800 + grp * 6 + slot * 2], g_regs[0x4800 + grp * 6 + slot * 2 + 1], v.format, v.stride);
+                    GpuLogLine(fetch);
+                }
+                for (uint32_t i = 0; i < 32; ++i) {
+                    if (!(si.tfetchMask & (1u << i))) continue;
+                    char fetch[256];
+                    const uint32_t r = 0x4800 + i * 6;
+                    std::snprintf(fetch, sizeof(fetch), "DRAWFETCH frame=%llu draw=%llu stage=%s kind=texture idx=%u words=%08X,%08X,%08X,%08X,%08X,%08X",
+                                  (unsigned long long)frame, (unsigned long long)g_drawsSeen, stageName, i,
+                                  g_regs[r], g_regs[r + 1], g_regs[r + 2], g_regs[r + 3], g_regs[r + 4], g_regs[r + 5]);
+                    GpuLogLine(fetch);
+                }
+            }
         }
         if (!active[0].info) ++g_drawsNoVs;
         if (!active[1].info) ++g_drawsNoPs;
-        if (!(Cfg().hist || Cfg().stateLog)) {   // M8: diagnostico H0 bajo demanda (snprintf + std::map por draw)
+        if (!(Cfg().hist || stateLogThis)) {   // M8: diagnostico H0 bajo demanda (snprintf + std::map por draw)
             if (backend::Get()) backend::Get()->OnDraw(ev, active[0].info.get(), active[1].info.get());
             return;
         }
