@@ -8,6 +8,7 @@
 #include "config.h"
 #include "fb_decode.h"
 #include "image_io.h"
+#include "viewer/viewer.h"
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -361,6 +362,7 @@ void D3D12Backend::OnSwap(const backend::SwapInfo& s) {
         std::vector<uint8_t>& rgba = fbScratch;   // M8: reutilizado (antes 3,6 MB nuevos por fotograma)
         if (ri && ri->x0 == 0 && ri->y0 == 0 && ri->w == s.w) {
             source = "resolve";
+            viewer::OnFrame(ri->rgba.data(), ri->w * 4, std::min(ri->w, kW), std::min(std::min(ri->h, s.h), kH), s.frame);
             PresentFromRgba(ri->rgba.data(), ri->w, std::min(ri->h, s.h));
         } else {
             FbDesc d;
@@ -369,7 +371,7 @@ void D3D12Backend::OnSwap(const backend::SwapInfo& s) {
             std::string info;
             bool okfb;
             { PERF_ZONE(kZoneFbDecode); okfb = DecodeFrontbuffer(d, rgba, &info); }
-            if (okfb) { source = "frontbuffer"; PresentFromRgba(rgba.data(), s.w, s.h); }
+            if (okfb) { source = "frontbuffer"; viewer::OnFrame(rgba.data(), s.w * 4, std::min(s.w, kW), std::min(s.h, kH), s.frame); PresentFromRgba(rgba.data(), s.w, s.h); }
             else Note("OMISION presentacion: no se pudo destilar el frontbuffer (" + info + ")");
         }
     }

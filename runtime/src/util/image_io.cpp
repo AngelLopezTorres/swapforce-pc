@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <wincodec.h>
 
+#include <algorithm>
 #include <vector>
 
 #pragma comment(lib, "windowscodecs.lib")
@@ -58,6 +59,70 @@ bool WritePngRGBA(const std::string& path, uint32_t w, uint32_t h, const uint8_t
     } while (false);
     Rel(pb); Rel(fr); Rel(enc); Rel(st); Rel(f);
     if (coInit) CoUninitialize();
+    return ok;
+}
+
+bool EncodeJpegRGBA(uint32_t w, uint32_t h, const uint8_t* rgba, uint32_t stride, uint32_t quality, std::vector<uint8_t>& out) {
+    out.clear();
+    if (!w || !h || !rgba) return false;
+    HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    bool coInit = SUCCEEDED(co);
+    IWICImagingFactory* f = nullptr;
+    IWICBitmapEncoder* enc = nullptr;
+    IWICBitmapFrameEncode* fr = nullptr;
+    IWICStream* st = nullptr;
+    IPropertyBag2* pb = nullptr;
+    IStream* ms = nullptr;
+    HGLOBAL hg = nullptr;
+    bool ok = false;
+    std::vector<uint8_t> bgr24((size_t)w * h * 3);
+    for (uint32_t y = 0; y < h; ++y)
+        for (uint32_t x = 0; x < w; ++x) {
+            const uint8_t* s = rgba + (size_t)y * stride + x * 4;
+            uint8_t* d = &bgr24[((size_t)y * w + x) * 3];
+            d[0] = s[2]; d[1] = s[1]; d[2] = s[0];
+        }
+    do {
+        if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&f)))) break;
+        if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, &ms))) break;
+        if (FAILED(f->CreateStream(&st))) break;
+        if (FAILED(st->InitializeFromIStream(ms))) break;
+        if (FAILED(f->CreateEncoder(GUID_ContainerFormatJpeg, nullptr, &enc))) break;
+        if (FAILED(enc->Initialize(st, WICBitmapEncoderNoCache))) break;
+        if (FAILED(enc->CreateNewFrame(&fr, &pb))) break;
+        // "ImageQuality" (0.0-1.0), Microsoft Learn: JPEG Format-Specific Encoder Options.
+        PROPBAG2 opt = {};
+        opt.pstrName = const_cast<LPOLESTR>(L"ImageQuality");
+        VARIANT var;
+        VariantInit(&var);
+        var.vt = VT_R4;
+        var.fltVal = (float)std::min<uint32_t>(100u, std::max<uint32_t>(1u, quality)) / 100.0f;
+        if (FAILED(pb->Write(1, &opt, &var))) break;
+        if (FAILED(fr->Initialize(pb))) break;
+        if (FAILED(fr->SetSize(w, h))) break;
+        // El codificador JPEG de WIC admite 24bppBGR; SetPixelFormat puede cambiar el formato solicitado,
+        // por eso se comprueba y los datos se preparan para el formato devuelto.
+        WICPixelFormatGUID fmt = GUID_WICPixelFormat24bppBGR;
+        if (FAILED(fr->SetPixelFormat(&fmt))) break;
+        if (fmt != GUID_WICPixelFormat24bppBGR) break;
+        if (FAILED(fr->WritePixels(h, w * 3, (UINT)bgr24.size(), bgr24.data()))) break;
+        if (FAILED(fr->Commit())) break;
+        if (FAILED(enc->Commit())) break;
+        LARGE_INTEGER zero = {};
+        ULARGE_INTEGER pos = {};
+        if (FAILED(ms->Seek(zero, STREAM_SEEK_CUR, &pos))) break;
+        if (FAILED(GetHGlobalFromStream(ms, &hg))) break;
+        void* p = GlobalLock(hg);
+        if (!p) break;
+        out.assign(static_cast<const uint8_t*>(p), static_cast<const uint8_t*>(p) + (size_t)pos.QuadPart);
+        GlobalUnlock(hg);
+        ok = !out.empty();
+    } while (false);
+    Rel(pb); Rel(fr); Rel(enc); Rel(st);
+    if (ms) ms->Release();
+    if (f) f->Release();
+    if (coInit) CoUninitialize();
+    if (!ok) out.clear();
     return ok;
 }
 

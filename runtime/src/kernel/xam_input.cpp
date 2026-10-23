@@ -5,6 +5,7 @@
 
 #include "guest_abi.h"
 #include "import_log.h"
+#include "viewer/viewer.h"
 
 using namespace rt;
 namespace rt { void ConfigureInputStartInjection(uint32_t afterCalls, uint32_t durationCalls); }
@@ -77,6 +78,7 @@ GUEST_IMPORT_IMPL(XamInputGetState) {
     State s{}; uint32_t user=ctx.r3.u32&0xFF;
     DWORD rc=ReadState(user,s);
     if (!rc && user == 0) {
+        s.pad.buttons |= rt::viewer::Buttons();   // visor en vivo: OR con la entrada local
         const uint32_t call = g_inputStateCalls.fetch_add(1, std::memory_order_relaxed) + 1;
         const uint32_t after = g_startInjectAfterCalls.load(std::memory_order_relaxed);
         const uint32_t duration = g_startInjectDurationCalls.load(std::memory_order_relaxed);

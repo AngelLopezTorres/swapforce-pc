@@ -18,15 +18,21 @@ Formal, escueto, metódico; solo datos objetivos y documentables, sin opiniones;
 - Audio mínimo (M2): 187,49 callbacks/s (sumidero nulo, no suena). Con audio activo el flujo cambia: un hilo muere con `__builtin_debugtrap` en `vupkd3d128 ...,20` (FLOAT16_4) en `sub_826D2AB8` y el hilo principal queda bloqueado en una sección crítica de ese hilo.
 - Rendimiento (M8, 2026-10-23, `--headless`): Bink 1 media 29,6 VdSwap/s y Bink 2 30,0 (tope del juego: 30, volteo cada 2 vblanks); 118 s consecutivos >= 20 sin carga concurrente. Detalle, opciones y verificaciones en `PROGRESS.md`, apartado «Rendimiento M8». Simplificaciones registradas como `SIMPLIFY` (MSAA 1X, sin EDRAM, sin resolve de profundidad, sin mips).
 
-## Trabajo en curso / sin verificar (importante)
-- M1 (decodificación CPU) quedó a medias cuando se cortó la sesión: `recompiler.cpp` modificado y `ppc_gen` regenerado con 0 `__builtin_debugtrap`, PERO no se verificó que compile ni que el juego avance. `runtime\build` puede no incluir M0/M2 (había un build aparte `build_fid`). El parche `patches\XenonRecomp-swapforce.patch` incluye ese estado sin comprobar.
-- Hallazgos de M1 a confirmar: las 2 `mulchw.` (0x83088AE0 y 0x83088C0C) son `vsldoi128` VX128_5 mal decodificadas; 129 `vupkd3d128` tipo 5; 1 `blrl`.
-- M3 (`--selftest-cpu` de los 49 opcodos vectoriales contra ALTIVECPEM/Power ISA) no iniciado; los 49 opcodos siguen sin verificar en ejecución.
+## Estado verificado (2026-10-23)
+- M1 y M3 cerrados: `ppc_gen` con 0 `__builtin_debugtrap`; `--selftest-cpu` fail=0 (690 funciones, 62 familias). Quedan sin implementar los tipos 1-4 y 6 de vupkd3d128/vpkd3d128 y otras instrucciones heredadas del upstream con convencion de 32 bits sin evaluar.
+- Bink: causa y arreglo documentados en PROGRESS.md (apartado Bink). M8: ~28 fps de VdSwap en --headless (tope del juego 30).
+- Visor en vivo: `--viewer [puerto]` sirve el ultimo fotograma por HTTP en 127.0.0.1 (opcion `--viewer-input` para teclas); ver PROGRESS.md (apartado Visor). Caida de fps medida 0,44 %.
+- Pendiente principal: el juego no progresa tras el video Bink 2 (imagen blanca fija). Diagnostico en curso en la rama codex-m4m5.
 
 ## Siguientes pasos (orden)
-1. Ejecutar `setup.ps1` con la ISO (ver README) y reconstruir; comprobar que compila con los cambios de M1.
-2. Cerrar M1: `grep -c __builtin_debugtrap runtime\ppc_gen\*.cpp`; repetir `SwapForceRT.exe --headless --bink-trace --d3d-stats --dump-frames 60,200,400 --timeout 90` y registrar hasta dónde avanza (hilos, excepciones, BINKPLANE, hashes Y distintos, nonblack_px).
-3. M3 (tests de CPU), M4 XMA, M5 entrada y Portal (ordinales 0x4A1/0x4A2 de xam), M6 fidelidad gráfica (EDRAM, MSAA, mips, formatos, logotipo invertido), M7 escala 2K/4K, M8 rendimiento ≥30 fps. Detalle y criterios de aceptación en `PLAN_FIDELIDAD.md`.
+1. Diagnostico de la pantalla blanca y del bloqueo tras gsbp_vvisions.bk2 (hilos, entrada START, contenido/perfil, SIMPLIFY del backend).
+2. M4 decodificacion XMA2 real; firmas GetRaw/SetRaw del Portal (sin escribir al dispositivo).
+3. M6 fidelidad grafica (EDRAM, MSAA, mips, formatos, logotipo invertido), M7 escala 2K/4K. Criterios en `PLAN_FIDELIDAD.md`.
 
 ## Entorno
 Windows 11, VS Build Tools 2022, LLVM/clang-cl, CMake, Ninja (rutas fijadas en `runtime\tools\vsenv.cmd`). Probado solo con RTX 4070 SUPER (y WARP). Salida estándar del exe muy voluminosa: redirigir a fichero.
+
+## Actualizacion 2026-10-23 (tras unir ramas)
+- Rama codex-m4m5 unida a main (XMA contextos, Portal USB selftest, entrada XInput). Compilado y ejecutado en un worktree con ppc_gen: --selftest-input/portal/xma/cpu OK, --selftest-gpu OK; ejecucion headless 150 s: ~28 fps de VdSwap medios, 0 excepciones guest (el hilo 41 ya no muere), pero la imagen queda en BLANCO uniforme (hash fijo 21AEC9254EADB383, ~596 draws y 46 resolves por frame) desde el fotograma ~650, justo tras el video Bink 2 de Vicarious Visions; el juego no carga mas .pak despues de gsbp_vvisions.bk2. Causa sin determinar [NV]: el juego queda parado (hash identico durante miles de fotogramas) o la escena final se renderiza blanca; hipotesis: fundido a blanco congelado, aproximaciones SIMPLIFY del backend, shader de composicion, textura vacia.
+- Siguiente paso: localizar con volcados de resolves (--dump-resolves) y volcado de hilos (--perf) donde espera el hilo principal y que pasada produce el blanco.
+- Reparto de agentes previsto: planifica Sonnet, ejecuta Haiku (Codex: gpt-6-luna esfuerzo max cuando haya tokens). Antigravity descartado (cuota agotada). Rama agy-pak (analisis .pak) NO unida: contiene CSV con nombres de assets del juego (decision legal pendiente).
