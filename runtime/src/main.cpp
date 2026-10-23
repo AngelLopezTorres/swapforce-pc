@@ -385,6 +385,7 @@ int main(int argc, char** argv) {
         if (!std::strcmp(argv[i], "--selftest-gpu") && i + 1 < argc) {
             std::string e;
             if (!rt::LoadPaths(const_cast<rt::Paths&>(rt::GetPaths()), &e)) { std::printf("ERROR: %s\n", e.c_str()); return 2; }
+            if (!userdataOverride.empty()) rt::SetUserdataDir(userdataOverride);
             if (!rt::GuestMemory::Init()) { std::printf("selftest-gpu: GuestMemory::Init fallo\n"); return 2; }
             rt::gpu::Cfg().noThreads = true;
             rt::gpu::Start();

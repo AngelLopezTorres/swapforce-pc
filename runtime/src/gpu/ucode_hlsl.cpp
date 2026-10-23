@@ -730,7 +730,8 @@ struct Emitter {
             out += "    r[0] = float4((float)xe_vertex_index(vid), 0.0f, 0.0f, 0.0f);\n";
             out += "    xe_body();\n    VSOut o;\n";
             out += "    float4 pp = oPos;\n";
-            out += "    if ((gDraw2.z & 4u) != 0u) pp.w = 1.0f / pp.w;\n";
+            // D3D clip coordinates require W0; VTX_W0_FMT=0 supplies its reciprocal.
+            out += "    if ((gDraw2.z & 4u) == 0u) pp.w = 1.0f / pp.w;\n";
             out += "    if ((gDraw2.z & 1u) != 0u) pp.xy *= pp.w;\n";
             out += "    if ((gDraw2.z & 2u) != 0u) pp.z *= pp.w;\n";
             out += "    pp.xyz = pp.xyz * gNdcScale.xyz + gNdcOffset.xyz * pp.w;\n";

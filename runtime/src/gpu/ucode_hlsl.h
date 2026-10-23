@@ -32,7 +32,7 @@ bool CompileHlslProfile(const std::string& hlsl, const wchar_t* profile, std::st
 std::string RectListGeometryShaderHlsl();
 
 // Version del traductor (parte de la clave de la cache de DXIL en disco).
-constexpr const char* kTranslatorVersion = "t2";
+constexpr const char* kTranslatorVersion = "t3";
 
 // Prueba H2: traduce y compila todos los ucode_*.bin de `dir`. Devuelve 0 si todos compilan.
 int RunShaderTest(const std::string& dir);

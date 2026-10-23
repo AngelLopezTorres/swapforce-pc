@@ -234,6 +234,23 @@ Referencias descargadas a `runtime\ref\` (no se distribuyen): Xenia `ppc_opcode_
 
 ## Codex M4-M5
 
+### Codex ronda 6 (2026-10-23)
+
+- Diagnóstico del draw final del frame 850: VS `A41B18BBB0634B34`, PS `DBF45809A08CE4F4`, `PA_CL_VTE_CNTL=0x43F` (`VTX_W0_FMT=1`), lista de seis índices. La memoria guest y la captura del VS dan UV de esquina `(0,0)`, `(0,1)`, `(1,0)`, `(1,1)`; el PS veía UV próximos a `(0,5; 0,5)` en toda la pantalla. El VS exportaba posición con `W≈16`, pero el traductor convertía ese valor en `1/W≈0,0625`; así las esquinas `XY≈±16` se proyectaban a `±256` y solo quedaba visible la zona central de la interpolación. La especificación pública de AMD para los bits homónimos indica que `VTX_W0_FMT=1` aporta W0 y `=0` aporta su recíproco ([AMD Evergreen 3D Registers v2](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/programmer-references/evergreen_3D_registers_v2.pdf)); la equivalencia exacta de ese documento con Xenos es [NV], pero el resultado experimental confirma la inversión en esta ruta.
+
+| Hipótesis de la ronda | Resultado | Evidencia |
+|---|---|---|
+| (a) Mapeo de interpolantes VS/PS | Refutada como origen | `nointerpolation` separó las salidas por vértice y un UV sintético produjo gradiente; con las posiciones originales el PS recibió ~127–128 en R/G. |
+| (b) Expansión de rectángulo | Refutada | El draw es triangle list, seis índices `[95,96,97,98,97,96]`. |
+| (c) Textura/muestreador | Refutada como origen del blanco | El resolve de entrada `19A3F000` contiene franjas rojas y blancas; el UV central caía en una zona blanca. |
+| (d) Vfetch | Refutada | Bytes guest y captura puntual del VS concuerdan en las cuatro UV de esquina. |
+| (e) ALU del UV | Refutada; confirmada inversión en conversión de posición W | El VS aplica `max(r0,r0)` al UV y exporta W≈16; la inversión de W en `ucode_hlsl.cpp` causaba el UV casi constante. |
+
+- Cambio mínimo: `VTX_W0_FMT=0` invierte W al producir clip space de D3D; `=1` conserva W. Versión de caché DXIL `t2→t3` para invalidar shaders anteriores. `--selftest-gpu` respeta `--userdata-dir` para aislar la ejecución. Se retiró la instrumentación temporal tras el diagnóstico. Compilación `runtime/build_codex_round6/build.cmd`: código 0. `git diff --check`: código 0.
+- Aceptación final `--headless --selftest-gpu`: código 0; PM4 ejecutado=1, color exacto RGB `(200,100,50)` en 921600 píxeles, `shader_fail=0`, `pso_fail=0`; artefactos `runtime/build_codex_round6/r6_final_selftest/`.
+- Juego `--headless --dump-frames 850,1000,1200 --timeout 70`: los tres PNG `runtime/build_codex_round6/r6_final_game/frames/d3d_*.png` son iguales, SHA-256 `A44E039AD3AB479DB35F6AB8D3815E3FD2725CDF4CDC4362F011C09FD063B01C`, 906240 píxeles no negros. Imagen: bandas horizontales rojas y blancas con artefactos rosas y margen inferior negro; ya no es blanco uniforme. La instancia de esta ejecución llegó a 1939 frames y salió por timeout (código 4), con `draws_ok=790791`, `shader_fail=0`, `pso_fail=0`, `removed=0`.
+- Siguiente bloqueo: las formas fragmentadas rojas y azul violáceas ya están presentes en `resolve_f00850_012_19CD3000_520x312.png`, antes de las pasadas de suavizado, escalado y copia al frontbuffer; el origen de esos artefactos y la ausencia del menú son [NV]. La imagen queda fija entre los frames 850 y 1200, aunque el hilo principal y los draws siguen avanzando. Se requiere rastrear el render anterior a ese resolve; no se atribuye sin prueba a XMA, entrada ni inicio de sesión.
+
 ### Quinta ronda (2026-10-23)
 
 - Se leyó `TAREA_CODEX.md`, `AGENTS.md`, `PLAN_FIDELIDAD.md`, `CLAUDE.md` completo y los apartados Bink/M8/Codex anteriores de este fichero. `CLAUDE.md` no contiene un encabezado literal «Actualización 2026-10-23»; sí incluye el estado M8 fechado ese día. La ruta indicada `runtime\ref` no existe en este worktree (`Test-Path runtime/ref=False`); el contraste local de GPU se limitó al código vendorizado `runtime/src/gpu/xenia/**` y a las referencias ya citadas en rondas anteriores. No se regeneró ni editó `runtime\ppc_gen`; no se hicieron escrituras al Portal USB ni operaciones Git de publicación.
