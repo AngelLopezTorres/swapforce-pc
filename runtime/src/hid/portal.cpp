@@ -274,6 +274,13 @@ namespace {
 PortalWriteMode g_writeModeSetting = PortalWriteMode::Auto;   // --portal-write
 bool g_coalesceS = true;   // --portal-queue=coalesce|fifo: descarta informes 'S' antiguos pendientes al llegar otro 'S'
 PortalXlate g_xlate = PortalXlate::StripHdr;                      // --portal-xlate (defecto provisional; ver PROGRESS.md)
+enum class PortalStateMode { Raw, Stable };
+PortalStateMode g_stateMode = PortalStateMode::Stable;   // --portal-state=raw|stable
+uint32_t PortalStateStatusOffset() {
+    if (g_xlate == PortalXlate::StripHdr || g_xlate == PortalXlate::StripHdr20) return 3;
+    if (g_xlate == PortalXlate::StripHdrLen) return 4;
+    return 1;
+}
 // Valor de Auto para VID_1430&PID_0150 (dispositivo de este equipo). Fijado tras medir (ver PROGRESS.md, Portal escrituras).
 constexpr PortalWriteMode kAutoDefault0150 = PortalWriteMode::ControlExact;
 
@@ -289,7 +296,37 @@ constexpr DWORD kPortalIoTimeoutMs = 100;          // timeout = 100 de Xenia (ha
 constexpr size_t kPortalReportCap = 64;
 constexpr size_t kPortalWriteCap = 16;
 
-struct PortalPacket { uint8_t type = 0; uint32_t len = 0; uint8_t data[kPortalReportSize]{}; };
+struct PortalPacket {
+    uint8_t type = 0;
+    uint32_t len = 0;
+    uint8_t data[kPortalReportSize]{};
+    uint8_t stateRawStatus = 0;
+    bool stateTransition = false, stateArrival = false, stateChangedMasked = false;
+};
+
+struct PortalStateEvent {
+    bool log = false;
+    uint8_t raw = 0, delivered = 0;
+    bool present = false, transition = false, masked = false, summary = false;
+    uint64_t reportsDelivered = 0, changedDelivered = 0;
+    uint64_t arrivalsDelivered = 0;
+};
+
+struct PortalQueueMetrics {
+    uint64_t reportsReceived = 0, changedReceived = 0;
+    uint64_t changedMasked = 0;
+    uint64_t coalescedS = 0, coalescedChanged = 0;
+    uint64_t droppedS = 0, droppedChanged = 0;
+};
+
+uint8_t PortalStateSignature(uint8_t status) {
+    // Bits observados como presencia/posición: 0x01, 0x04 y 0x08.
+    return static_cast<uint8_t>(status & 0x0Du);
+}
+
+bool PortalStatePresent(uint8_t status) {
+    return (status & 0x01u) != 0 || (status & 0x0Cu) != 0;
+}
 
 bool IsDisconnectError(DWORD e) {
     return e == ERROR_DEVICE_NOT_CONNECTED || e == ERROR_GEN_FAILURE ||
@@ -322,6 +359,47 @@ public:
         return true;
     }
 
+    void NormalizeStateReport(PortalPacket& report, PortalStateEvent& event) {
+        if (report.type != 0x53) return;
+        const uint32_t field = PortalStateStatusOffset();
+        if (field >= report.len) return;
+
+        const uint8_t status = report.data[field];
+        const uint8_t rawStatus = report.stateRawStatus;
+        const bool present = PortalStatePresent(status);
+        const bool transition = report.stateTransition;
+        const bool changed = (status & 0x02u) != 0;
+        ++stateReportsDelivered_;
+        if (changed) ++stateChangedDelivered_;
+        const uint8_t delivered = status;
+        if ((rawStatus & 0x02u) && !report.stateChangedMasked && report.stateArrival && present)
+            ++stateArrivalsDelivered_;
+        const bool summary = stateReportsDelivered_ == 1 || stateReportsDelivered_ % 1000 == 0;
+        if (changed || transition || report.stateChangedMasked || summary) {
+            event.log = true;
+            event.raw = rawStatus;
+            event.delivered = delivered;
+            event.present = present;
+            event.transition = transition;
+            event.masked = report.stateChangedMasked;
+            event.summary = summary;
+            event.reportsDelivered = stateReportsDelivered_;
+            event.changedDelivered = stateChangedDelivered_;
+            event.arrivalsDelivered = stateArrivalsDelivered_;
+        }
+    }
+
+    void ReadQueueMetrics(PortalQueueMetrics& metrics) {
+        std::lock_guard<std::mutex> lock(queueMu_);
+        metrics.reportsReceived = stateReportsReceived_;
+        metrics.changedReceived = stateChangedReceived_;
+        metrics.changedMasked = stateChangedMasked_;
+        metrics.coalescedS = coalescedS_;
+        metrics.coalescedChanged = coalescedChanged_;
+        metrics.droppedS = droppedS_;
+        metrics.droppedChanged = droppedChanged_;
+    }
+
     bool PushWrite(const uint8_t* data, uint32_t len) {
         std::lock_guard<std::mutex> lock(queueMu_);
         if (writes_.size() >= kPortalWriteCap) return false;
@@ -345,15 +423,62 @@ private:
 
     void PushReport(const PortalPacket& p) {
         std::lock_guard<std::mutex> lock(queueMu_);
-        if (g_coalesceS && p.type == 0x53) {
-            // El Portal emite rafagas de informes de estado 'S'; el juego lee uno por llamada (~20/s) y las respuestas
-            // (R/A/Q) quedaban ~1-2 s detras en la cola. Se conserva solo el 'S' mas reciente; el resto de informes no se toca.
-            for (auto it = reports_.begin(); it != reports_.end();) {
-                if (it->type == 0x53) { it = reports_.erase(it); ++coalescedS_; } else ++it;
+        PortalPacket queued = p;
+        if (queued.type == 0x53) {
+            ++stateReportsReceived_;
+            const uint32_t field = PortalStateStatusOffset();
+            if (field < queued.len) {
+                const uint8_t status = queued.data[field];
+                const bool changed = (status & 0x02u) != 0;
+                const uint8_t signature = PortalStateSignature(status);
+                const bool transition = !sourceStateKnown_ || signature != sourceStateSignature_;
+                const bool present = PortalStatePresent(status);
+                queued.stateRawStatus = status;
+                queued.stateTransition = transition;
+                queued.stateArrival = present && (!sourceStateKnown_ || !sourceStatePresent_);
+                if (changed) ++stateChangedReceived_;
+                if (g_stateMode == PortalStateMode::Stable && changed && sourceStateKnown_ && !transition) {
+                    queued.data[field] = static_cast<uint8_t>(status & ~0x02u);
+                    queued.stateChangedMasked = true;
+                    ++stateChangedMasked_;
+                }
+                sourceStateKnown_ = true;
+                sourceStateSignature_ = signature;
+                sourceStatePresent_ = present;
             }
         }
-        if (reports_.size() >= kPortalReportCap) { reports_.pop_front(); ++droppedReports_; }
-        reports_.push_back(p);
+        if (g_coalesceS && queued.type == 0x53) {
+            // El Portal emite rafagas de informes de estado 'S'; el juego lee uno por llamada (~20/s) y las respuestas
+            // (R/A/Q) quedaban ~1-2 s detras en la cola. Se conservan transiciones y candidatos de llegada; el resto
+            // de los informes 'S' antiguos se coalesce. Los demás tipos no se tocan.
+            for (auto it = reports_.begin(); it != reports_.end();) {
+                if (it->type == 0x53) {
+                    const uint32_t field = PortalStateStatusOffset();
+                    const bool changedCandidate = field < it->len && (it->data[field] & 0x02u);
+                    if (it->stateTransition || changedCandidate) { ++it; continue; }
+                    if (it->stateRawStatus & 0x02u) ++coalescedChanged_;
+                    it = reports_.erase(it);
+                    ++coalescedS_;
+                } else ++it;
+            }
+        }
+        if (reports_.size() >= kPortalReportCap) {
+            auto drop = reports_.begin();
+            for (auto it = reports_.begin(); it != reports_.end(); ++it) {
+                if (it->type != 0x53) continue;
+                const uint32_t field = PortalStateStatusOffset();
+                const bool changedCandidate = field < it->len && (it->data[field] & 0x02u);
+                if (!it->stateTransition && !changedCandidate) { drop = it; break; }
+            }
+            const PortalPacket& dropped = *drop;
+            if (dropped.type == 0x53) {
+                ++droppedS_;
+                if (dropped.stateRawStatus & 0x02u) ++droppedChanged_;
+            }
+            reports_.erase(drop);
+            ++droppedReports_;
+        }
+        reports_.push_back(queued);
     }
 
     void Run() {
@@ -577,6 +702,13 @@ private:
     std::deque<PortalPacket> reports_, writes_;
     uint64_t droppedReports_ = 0;
     uint64_t coalescedS_ = 0;
+    uint64_t stateReportsReceived_ = 0, stateChangedReceived_ = 0;
+    uint64_t stateChangedMasked_ = 0;
+    uint64_t coalescedChanged_ = 0, droppedS_ = 0, droppedChanged_ = 0;
+    bool sourceStateKnown_ = false, sourceStatePresent_ = false;
+    uint8_t sourceStateSignature_ = 0;
+    uint64_t stateReportsDelivered_ = 0, stateChangedDelivered_ = 0;
+    uint64_t stateArrivalsDelivered_ = 0;   // protegido por readMu
 };
 
 } // namespace
@@ -612,6 +744,14 @@ bool SetPortalQueue(const char* text) {
     if (!text) return false;
     if (!std::strcmp(text, "coalesce")) g_coalesceS = true;
     else if (!std::strcmp(text, "fifo")) g_coalesceS = false;
+    else return false;
+    return true;
+}
+
+bool SetPortalState(const char* text) {
+    if (!text) return false;
+    if (!std::strcmp(text, "raw")) g_stateMode = PortalStateMode::Raw;
+    else if (!std::strcmp(text, "stable")) g_stateMode = PortalStateMode::Stable;
     else return false;
     return true;
 }
@@ -668,8 +808,31 @@ void XamInputNonControllerGetRaw(PPCContext& ctx, uint8_t* base) {
             PortalPacket r;
             uint32_t n = 0;
             if (io.PopReport(r)) {
+                PortalStateEvent stateEvent;
+                io.NormalizeStateReport(r, stateEvent);
                 n = r.len < cap ? r.len : cap;
                 std::memcpy(base + bufPtr, r.data, n);
+                if (stateEvent.log) {
+                    PortalQueueMetrics queueMetrics;
+                    io.ReadQueueMetrics(queueMetrics);
+                    const char* action = stateEvent.summary && !stateEvent.masked && !stateEvent.transition && !(stateEvent.raw & 0x02u)
+                                             ? "resumen"
+                                             : (stateEvent.masked ? "changed_enmascarado" : "entregado");
+                    const char* mode = g_stateMode == PortalStateMode::Stable ? "stable" : "raw";
+                    ImportLog::Get().Printf("PORTAL STATE mode=%s call=%llu raw=%02X entregado=%02X presencia=%s transicion=%u accion=%s s_usb=%llu bit_cambiado_usb=%llu s_juego=%llu bit_cambiado_juego=%llu llegadas_cambiado_entregadas=%llu cambiado_enmascarado=%llu s_coalesced=%llu bit_cambiado_coalesced=%llu s_descartados=%llu bit_cambiado_descartado=%llu",
+                                            mode, static_cast<unsigned long long>(call), stateEvent.raw, stateEvent.delivered,
+                                            stateEvent.present ? "si" : "no", (unsigned)stateEvent.transition, action,
+                                            static_cast<unsigned long long>(queueMetrics.reportsReceived),
+                                            static_cast<unsigned long long>(queueMetrics.changedReceived),
+                                            static_cast<unsigned long long>(stateEvent.reportsDelivered),
+                                            static_cast<unsigned long long>(stateEvent.changedDelivered),
+                                            static_cast<unsigned long long>(stateEvent.arrivalsDelivered),
+                                            static_cast<unsigned long long>(queueMetrics.changedMasked),
+                                            static_cast<unsigned long long>(queueMetrics.coalescedS),
+                                            static_cast<unsigned long long>(queueMetrics.coalescedChanged),
+                                            static_cast<unsigned long long>(queueMetrics.droppedS),
+                                            static_cast<unsigned long long>(queueMetrics.droppedChanged));
+                }
                 // Registro de lo que consume el juego (se omiten los informes de estado 'S' por volumen).
                 const bool hdr = g_xlate == PortalXlate::StripHdr || g_xlate == PortalXlate::StripHdrLen || g_xlate == PortalXlate::StripHdr20;
                 const uint8_t type = hdr ? r.data[(g_xlate == PortalXlate::StripHdrLen) ? 3 : 2] : r.data[0];

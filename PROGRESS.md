@@ -789,3 +789,31 @@ FFmpeg `n8.1.3-24-g92611900bb-20261023`, build BtbN `win64-lgpl-shared`: `https:
 - `--audio=wasapi` sin dispositivo (caída a nulo) está implementado pero NO se ha ejercitado (el equipo tiene dispositivo).
 - Sincronía imagen/sonido de FMV01 y fidelidad auditiva (mezcla 5.1 a estéreo, nivel, recortes en ráfagas de pico 1,000): solo comprobables oyéndolo.
 - La semántica fina de XMA (frontera de buffers, desplazamiento de lectura exacto dentro del paquete, bucles) procede de la memoria de `xma_context.cc` de Xenia, que no está en `runtime\ref` [NV]; contrastada solo con el flujo del juego y con `ffmpeg.exe`.
+
+## Codex ronda 10 (2026-10-23; worktree `_wt_portal3`, rama `portal-xbox`)
+
+### Cambios
+- `--portal-state=raw|stable` en `main.cpp` y `portal.cpp`; defecto `stable`. En `stable`, se limpia el bit 1 de `S` cuando la firma observada de presencia/posición (`status & 0x0D`) no cambia. Se conserva la transición de presencia/posición y se etiqueta para que `coalesce` no la borre. Si la cola se llena, se descarta primero un resumen `S` en vez de una transición/candidato de llegada.
+- `PORTAL STATE` registra estado bruto/entregado, transiciones, bits cambiados recibidos/entregados/enmascarados y descartes/coalescing. `raw` permite comparar sin normalización.
+- No se modificó `runtime/src/gpu/**`: en las pantallas capturadas no se aisló un defecto gráfico reproducible.
+
+### Compilación y CLI
+- `runtime/build_codex_r10/vb_portal_r10.cmd`: código de salida 0; compiló `portal.cpp` y enlazó `out/SwapForceRT.exe`. La invocación de `vswhere.exe` produjo una advertencia, sin impedir Ninja ni el enlace.
+- `SwapForceRT.exe --headless --portal-state=invalid`: código 2 y mensaje `--portal-state: valor no valido: invalid`.
+- Tras la compilación se corrigió la inserción en cola para que encole el informe normalizado y sus metadatos, no el paquete original. Se recompiló con código 0. La prueba física posterior a esta última corrección queda pendiente por conflicto de propiedad del Portal descrito abajo.
+
+### Diagnóstico y capturas del Portal
+- En `runs/stable_r10_90s` se completaron 90 descargas de `/frame.jpg`, cada 1 s (intervalo observado medio 1,000 s; extremos 0,982 y 1,024 s), cruzando seis parejas `A 00/A 01`. En la ventana de 120–210 s hubo seis informes brutos `S 03`, cada uno tras `A 01` y seguido por `S 01` en 1–21 ms; no hubo `S 00`, `S 02`, `S 04` ni `S 0C` en esa ventana. Esto vincula los `S 03` observados con las reactivaciones periódicas del juego; por sí solo no demuestra el estado físico de la figura.
+- Esa ejecución usó `--portal-queue=coalesce`: en el resumen de 189,471 s figuran `s_usb=10455`, `bit_cambiado_usb=6`, `s_juego=3000`, `bit_cambiado_juego=0`, `llegadas_cambiado_entregadas=0`, `cambiado_enmascarado=0`, `s_coalesced=7455`, `bit_cambiado_coalesced=6` y `s_descartados=0`. Por tanto, esa medida demuestra que `coalesce` ya eliminaba esos seis candidatos antes de `GetRaw`; no demuestra el efecto aislado del nuevo filtro `stable`.
+- Se observaron 332 solicitudes `Q`, 332 respuestas USB y 331 respuestas entregadas al juego antes de detener la captura. Latencia USB→`GetRaw`: media 35,56 ms, mediana 29,31 ms, mínimo 13,25 ms y máximo 72,93 ms. No se midió una demora de segundos en esa ejecución.
+- Rendimiento en la captura sin verificadores costosos: 90 muestras, media 54,97 FPS, mínimo 19 y máximo 60,05. No se afirma que mantuviera 60 FPS constantes.
+- Capturas abiertas: título con transición del pasillo; aviso de perfil legible; menú Story/Arena/Options legible; dificultad Easy con descripción legible; FMV01 con nubes y espiral muy luminosas. En los fotogramas de 1 s se ven transiciones amarillas/naranjas, la espiral azul y el aviso `PLEASE PLACE YOUR SKYLANDER`, sin texto ilegible o artefactos persistentes evidentes. El banner `MEGA RAM SPYRO SERIES 3` no aparece en esta ventana, por lo que su estabilidad no queda acreditada.
+- Una captura FIFO iniciada con la versión que aún no encolaba la copia normalizada llegó a 71 JPEG y se detuvo. El log registró error USB 433 cuando apareció otro proceso `SwapForceRT`; no se usa como aceptación de la corrección. La versión corregida sí compila, pero aún no dispone de una captura física válida.
+
+### Texturas y verificación GPU
+- En `runs/stable_90s/stdout.txt`, `tex-verify`: 6 comparaciones, 0 diferencias; `resolve-verify`: 44, 0; `verify-shortcut`: 204, 0 píxeles distintos; `present-verify`: 10, 0; `depth-resolve-verify`: 13, 0. No se registraron omisiones de textura. Estos resultados son de las rutas/formats efectivamente alcanzados, no validan todos los formatos solicitados.
+- Los volcados inspeccionados incluyen texturas BC3 y atlas de fuentes; los glifos se ven definidos en los atlas y el texto de menú/dificultad es legible en el frame final. El volcado del logo está invertido verticalmente en crudo, mientras que el logo renderizado aparece derecho. No se identificó una corrección GPU respaldada por comparación; los mips siguen sin decodificación y 565/1555/4444/10_11_11/11_11_10/BC1/2/5, tamaños no potencia de 2 y tiling/endian no quedan verificados en conjunto [NV].
+
+### Pendiente de ejecución final
+- `AGENTS.md` limita el Portal físico a un proceso a la vez y prohíbe detener procesos de otro propietario sin autorización. Se observaron instancias externas `SwapForceRT` (PID 23536, inicio 21:11:44; PID 45956, 21:12:44; PID 22096, 21:13:45 local); `Get-CimInstance` y `tasklist` devolvieron «Acceso denegado», por lo que su ruta/propietario es [NV]. El PID previo de la captura propia fue detenido; no se cerró ningún PID ajeno.
+- La prueba de 90 s con el código ya corregido y la sesión final en `http://127.0.0.1:8765/` quedan pendientes hasta que el Portal no esté ocupado. No se ejecutaron `git add`, `git commit` ni `git push`.

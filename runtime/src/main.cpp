@@ -293,6 +293,9 @@ int main(int argc, char** argv) {
         else if (!std::strncmp(argv[i], "--portal-queue=", 15)) {   // coalesce|fifo (portal.h)
             if (!rt::hid::SetPortalQueue(argv[i] + 15)) { std::printf("--portal-queue: valor no valido: %s\n", argv[i] + 15); return 2; }
         }
+        else if (!std::strncmp(argv[i], "--portal-state=", 15)) {   // raw|stable (portal.h)
+            if (!rt::hid::SetPortalState(argv[i] + 15)) { std::printf("--portal-state: valor no valido: %s\n", argv[i] + 15); return 2; }
+        }
         else if (!std::strcmp(argv[i], "--selftest-xma")) xmaSelfTest = true;
         else if (!std::strcmp(argv[i], "--gpu-regdump")) rt::gpu::Cfg().regDump = true;
         else if (!std::strcmp(argv[i], "--gpu-log") && i + 1 < argc) rt::gpu::Cfg().logPath = argv[++i];
