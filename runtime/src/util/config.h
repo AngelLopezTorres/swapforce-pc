@@ -6,6 +6,7 @@ namespace rt {
 struct Paths {
     std::string runtimeDir; // directorio runtime\ (contiene config\paths.ini)
     std::string isoRoot;
+    std::string isoRootEsIt; // opcional: ficheros de la edicion (Es,It); si esta vacio no hay es/it
     std::string image;
     std::string xex;
     std::string cacheDir;

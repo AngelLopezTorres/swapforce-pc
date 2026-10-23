@@ -33,6 +33,7 @@ namespace rt { extern bool g_binkProbeOn; extern bool g_importSerialize; extern 
 namespace rt { void ConfigureInputStartInjection(uint32_t afterCalls, uint32_t durationCalls); }
 namespace rt { void ConfigureXamUser0SignedIn(bool enabled, uint32_t afterCalls); }
 static std::string g_userdataOverride;
+static std::string g_isoRootOverride;   // --iso-root <dir>: carpeta de ficheros del juego distinta de paths.ini
 PPC_EXTERN_FUNC(__imp__XamInputGetState);
 PPC_EXTERN_FUNC(__imp__XamInputGetCapabilities);
 PPC_EXTERN_FUNC(__imp__XexGetModuleHandle);
@@ -225,9 +226,19 @@ static bool XmaSelfTest(uint8_t* base) {
     return ok;
 }
 
+namespace rt { extern uint32_t g_guestLanguage; }
 static bool LoadAll(std::string& err, rt::ImageLoadResult& img, rt::XexHeaderInfo& xex, int& vars) {
     if (!rt::LoadPaths(const_cast<rt::Paths&>(rt::GetPaths()), &err)) return false;
     if (!g_userdataOverride.empty()) rt::SetUserdataDir(g_userdataOverride);
+    if (!g_isoRootOverride.empty()) const_cast<rt::Paths&>(rt::GetPaths()).isoRoot = g_isoRootOverride;
+    {   // idioma: es/it viven en la edicion (Es,It) y en/de en la (En,De); cada una declara en sus .pak los idiomas que acepta
+        rt::Paths& pp = const_cast<rt::Paths&>(rt::GetPaths());
+        if (rt::g_guestLanguage == 0) rt::g_guestLanguage = pp.isoRootEsIt.empty() ? 1 : 5;
+        bool esit = rt::g_guestLanguage == 5 || rt::g_guestLanguage == 6;
+        if (esit && !pp.isoRootEsIt.empty()) pp.isoRoot = pp.isoRootEsIt;
+        else if (esit) std::printf("AVISO: --language es/it requiere iso_root_es_it en config\\paths.ini (edicion Es,It); se usa la edicion principal\n");
+        std::printf("Idioma=%u raiz=%s\n", rt::g_guestLanguage, pp.isoRoot.c_str());
+    }
     if (!rt::GuestMemory::Init()) { err = "no se puede reservar 4 GB alineados"; return false; }
     if (!rt::LoadGameImage(rt::GetPaths().image, img, &err)) return false;
     if (!rt::LoadXexHeader(rt::GetPaths().xex, xex, &err)) return false;
@@ -263,6 +274,7 @@ int main(int argc, char** argv) {
         if (!std::strcmp(argv[i], "--max-imports") && i + 1 < argc) log.Config().maxImports = std::strtoull(argv[++i], nullptr, 0);
         else if (!std::strcmp(argv[i], "--log") && i + 1 < argc) logPath = argv[++i];
         else if (!std::strcmp(argv[i], "--userdata-dir") && i + 1 < argc) userdataOverride = argv[++i];
+        else if (!std::strcmp(argv[i], "--iso-root") && i + 1 < argc) g_isoRootOverride = argv[++i];
         else if (!std::strcmp(argv[i], "--inject-start-after-calls") && i + 1 < argc) inputStartAfterCalls = (uint32_t)std::strtoul(argv[++i], nullptr, 0);
         else if (!std::strcmp(argv[i], "--inject-start-duration-calls") && i + 1 < argc) inputStartDurationCalls = (uint32_t)std::strtoul(argv[++i], nullptr, 0);
         else if (!std::strcmp(argv[i], "--test-user0-signed-in")) testUser0SignedIn = true;
@@ -295,7 +307,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--no-audio")) rt::g_noAudio = true;
         else if (!std::strncmp(argv[i], "--language=", 11)) {
             const char* v = argv[i] + 11;
-            rt::g_guestLanguage = !std::strcmp(v, "en") ? 1 : !std::strcmp(v, "de") ? 3 : !std::strcmp(v, "fr") ? 4 : !std::strcmp(v, "it") ? 6 : 5;
+            rt::g_guestLanguage = !std::strcmp(v, "en") ? 1 : !std::strcmp(v, "de") ? 3 : !std::strcmp(v, "es") ? 5 : !std::strcmp(v, "it") ? 6 : 0;   // otro valor: automatico
         }
         else if (rt::AudioParseArg(argc, argv, i)) {}   // --audio=, --dump-audio, --xma-capture, --xma-file (audio_sink / xma)
         else if (!std::strcmp(argv[i], "--swap-interval") && i + 1 < argc) rt::gpu::Cfg().swapInterval = (uint32_t)std::strtoul(argv[++i], nullptr, 0) & 15;

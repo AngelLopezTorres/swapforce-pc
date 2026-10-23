@@ -47,6 +47,10 @@ bool LoadPaths(Paths& out, std::string* err) {
     auto get = [&](const char* k) { return Canon(found + "\\" + kv[k]); };
     out.runtimeDir = found;
     out.isoRoot = get("iso_root");
+    if (kv.count("iso_root_es_it") && !kv["iso_root_es_it"].empty()) {
+        std::string r = Canon(found + "\\" + kv["iso_root_es_it"]);
+        if (Exists(r + "\\default.xex")) out.isoRootEsIt = r;
+    }
     out.image = get("image");
     out.xex = get("xex");
     out.cacheDir = get("cache");
