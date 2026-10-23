@@ -391,6 +391,14 @@ int main(int argc, char** argv) {
         }
     }
     if (!log.Open(logPath)) { std::fprintf(stderr, "no se puede abrir %s\n", logPath.c_str()); return 2; }
+    {   // sesion por el visor (localhost): sin sonido por defecto; --audio=wasapi lo activa
+        bool viewer = false, audioGiven = false;
+        for (int k = 1; k < argc; ++k) {
+            if (!std::strcmp(argv[k], "--viewer")) viewer = true;
+            if (!std::strncmp(argv[k], "--audio=", 8) || !std::strcmp(argv[k], "--no-audio")) audioGiven = true;
+        }
+        if (viewer && !audioGiven) { char* fa[] = { argv[0], (char*)"--audio=null" }; int fi = 1; rt::AudioParseArg(2, fa, fi); }
+    }
     g_userdataOverride = userdataOverride;
     rt::SetSyncTraceHandle(traceKernelHandle);
     rt::ConfigureInputStartInjection(inputStartAfterCalls, inputStartDurationCalls);
