@@ -3,6 +3,8 @@
 XenonAnalyse no detecto (ScanTable no encuentra el cmplwi/bgt dentro de 32 instrucciones: tablas anidadas).
 Criterio de inclusion: patron completo + palabras consecutivas de la tabla dentro de .text (4 alineadas) +
 un cmplwi/cmpwi previo (hasta 400 instrucciones atras) con inmediato N-1, donde N es el numero de entradas.
+Variante 2 (indice acotado por mascara, sin cmplwi): el registro indice proviene de rlwinm rX,rY,0,mb,31 (valores 0..2^(32-mb)-1),
+opcionalmente seguido de addi rX,rX,K; se acepta si ese maximo vale N-1 (N = numero de entradas validas consecutivas).
 Salida: extra_switch_tables.toml (formato [[switch]] de XenonAnalyse) y lista de no confirmadas."""
 import os, re, struct, sys
 here = os.path.dirname(os.path.abspath(__file__))
@@ -19,6 +21,22 @@ if os.path.exists(extra_path):
 op = lambda w: w >> 26
 xo = lambda w: (w >> 1) & 0x3FF
 s16 = lambda v: v - 0x10000 if v & 0x8000 else v
+def index_bound(reg, pos, depth=0):
+    """Maximo valor del registro `reg` justo antes de la instruccion `pos` (indice de palabra), o None si no se puede acotar.
+    Solo entiende rlwinm con sh=0 y me=31 (mascara de los bits bajos) y addi con constante >= 0 sobre un registro acotado."""
+    if depth > 3: return None
+    for j in range(pos - 1, pos - 40, -1):
+        w = words[j]
+        if op(w) == 21 and ((w >> 16) & 31) == reg:
+            if ((w >> 11) & 31) == 0 and ((w >> 1) & 31) == 31 and ((w >> 6) & 31) > 0:
+                return (1 << (32 - ((w >> 6) & 31))) - 1
+            return None
+        if op(w) == 14 and ((w >> 21) & 31) == reg:
+            src, k = (w >> 16) & 31, s16(w & 0xFFFF)
+            if src == 0 or k < 0: return None
+            b = index_bound(src, j, depth + 1)
+            return None if b is None else b + k
+    return None
 out, unconfirmed = [], []
 for i in range((CB - B) // 4, (CE - B) // 4 - 6):
     w0, w1, w2, w3, w4, w5 = words[i:i + 6]
@@ -51,6 +69,9 @@ for i in range((CB - B) // 4, (CE - B) // 4 - 6):
     if not conf:
         # busqueda ampliada: cualquier cmplwi/cmpwi con N-1 en las 400 instrucciones previas
         conf = any(op(words[i - k]) in (10, 11) and (words[i - k] & 0xFFFF) == n - 1 for k in range(1, 215))
+    if not conf:
+        b = index_bound(rs, i + 1 if isrl(w1) else i + 2)   # posicion del rlwinm (el indice rs se lee ahi)
+        conf = b is not None and b == n - 1
     if not conf: unconfirmed.append((a, 'n=%d sin cmplwi N-1 cercano' % n)); continue
     out.append((a, rs, labels))
 with open(extra_path, 'w') as f:
