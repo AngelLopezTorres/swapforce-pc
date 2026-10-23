@@ -246,6 +246,7 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+namespace rt { extern uint32_t g_guestLanguage; }
 int main(int argc, char** argv) {
     SetUnhandledExceptionFilter(CrashFilter);
     auto& log = rt::ImportLog::Get();
@@ -292,6 +293,10 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--dump-fb")) { rt::gpu::Cfg().dumpFb = true; rt::gpu::d3d::g_strictResolveSync = true; }   // M60: el volcado lee la memoria guest en XE_SWAP
         else if (!std::strcmp(argv[i], "--no-d3d")) rt::gpu::Cfg().noD3d = true;
         else if (!std::strcmp(argv[i], "--no-audio")) rt::g_noAudio = true;
+        else if (!std::strncmp(argv[i], "--language=", 11)) {
+            const char* v = argv[i] + 11;
+            rt::g_guestLanguage = !std::strcmp(v, "en") ? 1 : !std::strcmp(v, "de") ? 3 : !std::strcmp(v, "fr") ? 4 : !std::strcmp(v, "it") ? 6 : 5;
+        }
         else if (rt::AudioParseArg(argc, argv, i)) {}   // --audio=, --dump-audio, --xma-capture, --xma-file (audio_sink / xma)
         else if (!std::strcmp(argv[i], "--swap-interval") && i + 1 < argc) rt::gpu::Cfg().swapInterval = (uint32_t)std::strtoul(argv[++i], nullptr, 0) & 15;
         else if (!std::strcmp(argv[i], "--log-time")) rt::g_importLogTime = true;

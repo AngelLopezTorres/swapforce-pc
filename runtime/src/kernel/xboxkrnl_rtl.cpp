@@ -13,6 +13,8 @@
 
 using namespace rt;
 
+namespace rt { uint32_t g_guestLanguage = 5; }   // XC_LANGUAGE de la consola: 1 ingles, 2 japones, 3 aleman, 4 frances, 5 espanol, 6 italiano [NV: tabla de Xenia]
+
 static constexpr uint32_t ST_BUFFER_TOO_SMALL = 0xC0000023;
 
 GUEST_IMPORT_IMPL(RtlImageXexHeaderField) {
@@ -117,7 +119,7 @@ GUEST_IMPORT_IMPL(ExGetXConfigSetting) {
     bool ok = false;
     if (cat == 2 && set == 2) { value = 0x1000; ok = true; }                         // AV_REGION
     else if (cat == 3 && set >= 1 && set <= 7) { value = 0; ok = true; }            // TIME_ZONE_*
-    else if (cat == 3 && set == 9) { value = 1; ok = true; }                         // LANGUAGE (Xenia: user_language=1) [NV]
+    else if (cat == 3 && set == 9) { value = g_guestLanguage; ok = true; }          // LANGUAGE (--language=en|es|fr|de|it; defecto es) [NV]
     else if (cat == 3 && set == 0xA) { value = 0x00040000; ok = true; }              // VIDEO_FLAGS
     else if (cat == 3 && set == 0xC) { value = 0; ok = true; }                       // RETAIL_FLAGS
     else if (cat == 3 && set == 0xE) { value = 103; size = 1; ok = true; }           // COUNTRY (Xenia: user_country=103) [NV]
