@@ -268,6 +268,9 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--io-selftest")) iotest = true;
         else if (!std::strcmp(argv[i], "--selftest-input")) inputSelfTest = true;
         else if (!std::strcmp(argv[i], "--selftest-portal")) portalSelfTest = true;
+        else if (!std::strncmp(argv[i], "--portal-write=", 15)) {   // auto|interrupt|control|control-pad32 (portal.h)
+            if (!rt::hid::SetPortalWriteMode(argv[i] + 15)) { std::printf("--portal-write: valor no valido: %s\n", argv[i] + 15); return 2; }
+        }
         else if (!std::strcmp(argv[i], "--selftest-xma")) xmaSelfTest = true;
         else if (!std::strcmp(argv[i], "--gpu-regdump")) rt::gpu::Cfg().regDump = true;
         else if (!std::strcmp(argv[i], "--gpu-log") && i + 1 < argc) rt::gpu::Cfg().logPath = argv[++i];

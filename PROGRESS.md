@@ -609,3 +609,52 @@ PNG/JPEG abiertos: título (`b2`, `i2`), diálogo de perfil, menú principal y d
 1. Mantener 60 fps por defecto (`--swap-interval 1`) o volver a 30 (`--swap-interval 0`).
 2. Aceptar la política de sincronización de resolves (cambio 4) o la estricta de M8 (`--strict-resolve-sync`).
 3. Autorizar la prueba con ventana (`--window-noactivate`).
+
+## Portal escrituras (2026-10-23, rama portal-write, propietario Audio/entrada)
+
+Autorización: escrituras solo como paso directo de los bytes que envía el juego en `XamInputNonControllerSetRaw` (cambia el medio de transporte, no el contenido). No se envió ningún comando propio, sonda, LED ni reset. No se pidió GET_DESCRIPTOR ni se leyó el descriptor de informe (HID) [NV]: solo se usa la configuración cacheada que libusbK ya devuelve al abrir.
+
+### Diagnóstico (evidencia)
+- Windows: `Spyro Porta` (`USB\VID_1430&PID_0150\5&2CF64626&0&3`), clase `libusbk devices`, servicio `libusbK`, estado OK. No aparece ningún hijo HID (`HID\VID_1430...`): sin pila HID, las transferencias van por libusbK.
+- Descriptor de interfaz 0 (log, `PORTAL USB descriptor`): clase `03` (HID), subclase `00`, protocolo `00`, `bNumEndpoints=2`.
+- Endpoints (log, `PORTAL USB endpoint`): `0x81` tipo 3 (interrupt) IN mps 32; `0x01` tipo 3 (interrupt) OUT mps 32. Confirma que `0x01` existe como interrupt OUT.
+- Hipótesis de HID (SET_REPORT por control): la interfaz es de clase HID. Aún no se ha contrastado el informe de salida (ID, longitud): requiere el descriptor de informe. [NV]
+
+### Variantes medidas (mismo código, mismo juego, `--headless --viewer 8771 --viewer-input`, Portal conectado)
+| Modo | Transferencias OUT | Resultado win32 | Observación |
+|---|---|---|---|
+| `interrupt` (UsbK_WritePipe ep 0x01) | 179 | 124 × 121 (tiempo agotado), 55 × 995 (ERROR_OPERATION_ABORTED), 0 OK | Reproduce el fallo previo. Causa de 995: [NV] |
+| `control` (SET_REPORT 21/09/0200/0000/len, len=4) | 178 | 178 × OK | Bytes del juego `0B 14 52 00`, sin relleno |
+| `control-pad32` (igual, relleno a 32 B) | 175 | 175 × OK | Relleno con ceros hasta 32 B |
+| `auto` (por defecto; 1430:0150 → `control`) | 184 | 184 × OK, 0 cierres | Comprobado tras corregir la comparación de ruta (ver abajo) |
+
+Lecturas IN (ep 0x81, 32 B) en las cuatro ejecuciones: 1097 / 1245 / 1065 / 1604 OK, sin ERR. En todas: `53 00 00 00 00 NN` con bytes 6..31 a cero; solo cambia NN (contador). NN incrementa de 1 a 8 entre informes consecutivos (moda 2). No se observó cambio en otros bytes tras las escrituras; el significado del contador no está verificado [NV].
+
+Nota: el proceso de la prueba `control` terminó tras 3313 fotogramas (`viewer: detenido`, sin excepción registrada); causa [NV]. La captura final no se obtuvo.
+
+### Cambios
+- `runtime/src/hid/portal.h`: enum `PortalWriteMode {Auto, Interrupt, ControlExact, ControlPad32}` y `SetPortalWriteMode`.
+- `runtime/src/hid/portal.cpp`:
+  - `UsbK_ControlTransfer` cargado de forma opcional (`GetProcAddress`); firma según encabezado libusbK, [NV] no contrastada con el encabezado en este equipo.
+  - Registro del descriptor de interfaz y de cada endpoint al abrir.
+  - Modo resuelto al abrir: `--portal-write` explícito; `auto` aplica `kAutoDefault0150` (= `control`) si la ruta contiene VID_1430&PID_0150 (sin distinguir mayúsculas), y `interrupt` en otro caso.
+  - Modo control: SET_REPORT `bmRequestType 0x21, bRequest 0x09, wValue 0x0200 (informe de salida, id 0), wIndex 0 (interfaz 0)`, con `wLength` = longitud del SetRaw o 32 con relleno. Timeout de 100 ms sobre el pipe 0.
+  - Cada transferencia registra `via=`, setup, longitud, `tx`, primeros 32 B y `res=OK|ERR(win32=N)`.
+  - La lectura IN no bloqueante y la reconexión (reapertura cada 500 ms, cierre ante errores de desconexión) no cambian.
+- `runtime/src/main.cpp`: opción `--portal-write=auto|interrupt|control|control-pad32`; valor no válido → código 2 (verificado).
+- Ref. copiadas en `runtime/ref/` (ignorado por Git): `hwportal_canary.cc`, `portal_canary.cc`.
+
+### Errores detectados durante la verificación
+- Primera compilación: tipo `PULONG` frente a `UINT*` en `UsbK_ControlTransfer`. Corregido; recompilado.
+- Primera ejecución `auto`: resolvió a `interrupt` porque la ruta de interfaz de Windows va en minúsculas (`vid_1430&pid_0150`). Corregido con la función sin distinción de mayúsculas; verificado en la ejecución posterior.
+
+### Compilación
+`runtime\build_portal2` (Ninja, clang-cl, `-DSWAPFORCE_OUT_DIR=...\build_portal2\out`): compila y enlaza sin errores (`out\SwapForceRT.exe`).
+
+### Pendiente / [NV]
+- Descriptor de informe HID (ID y longitud del informe de salida) no leído: si el dispositivo espera 4 o 32 B no está determinado; ambos modos responden `OK`.
+- No se ha observado respuesta del dispositivo distinta del contador en IN.
+- Reconexión física no probada (requiere desconectar el Portal; acción del usuario).
+- Causa de `ERROR_OPERATION_ABORTED` (995) en el modo interrupt: [NV].
+- Referencias citadas en la instrucción de la tarea (USB HID 1.11 §7.2.2; documentación libusbK/Microsoft Learn): no consultadas en esta sesión (sin descargas) [NV].
+- Procesos `SwapForceRT` de otros worktrees (`_wt_codex\runtime\build_live3`, `build_codex_round9`) no tocados.

@@ -33,6 +33,8 @@ using UsbKSetPipePolicyFn = BOOL(WINAPI*)(KUSB_HANDLE, UCHAR, UINT, UINT, PVOID)
 using UsbKReadPipeFn = BOOL(WINAPI*)(KUSB_HANDLE, UCHAR, PUCHAR, UINT, PUINT, LPOVERLAPPED);
 using UsbKWritePipeFn = BOOL(WINAPI*)(KUSB_HANDLE, UCHAR, PUCHAR, UINT, PUINT, LPOVERLAPPED);
 using UsbKAbortPipeFn = BOOL(WINAPI*)(KUSB_HANDLE, UCHAR);
+// Firma según el encabezado de libusbK (UsbK_ControlTransfer): SetupPacket por valor. [NV] no contrastada con el encabezado en este equipo.
+using UsbKControlTransferFn = BOOL(WINAPI*)(KUSB_HANDLE, WINUSB_SETUP_PACKET, PUCHAR, ULONG, PULONG, LPOVERLAPPED);
 
 struct LibUsbKApi {
     HMODULE dll = nullptr;
@@ -45,6 +47,7 @@ struct LibUsbKApi {
     UsbKReadPipeFn readPipe = nullptr;
     UsbKWritePipeFn writePipe = nullptr;
     UsbKAbortPipeFn abortPipe = nullptr;
+    UsbKControlTransferFn controlTransfer = nullptr;   // opcional: solo modos control
 
     bool Load() {
         dll = LoadLibraryExW(L"libusbK.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -58,6 +61,7 @@ struct LibUsbKApi {
         readPipe = reinterpret_cast<UsbKReadPipeFn>(GetProcAddress(dll, "UsbK_ReadPipe"));
         writePipe = reinterpret_cast<UsbKWritePipeFn>(GetProcAddress(dll, "UsbK_WritePipe"));
         abortPipe = reinterpret_cast<UsbKAbortPipeFn>(GetProcAddress(dll, "UsbK_AbortPipe"));
+        controlTransfer = reinterpret_cast<UsbKControlTransferFn>(GetProcAddress(dll, "UsbK_ControlTransfer"));
         return initialize && free && claimInterface && queryInterfaceSettings && queryPipe && setPipePolicy && readPipe && writePipe && abortPipe;
     }
 
@@ -267,6 +271,10 @@ static void LogRawCall(const char* name, PPCContext& ctx, uint8_t* base) {
 
 namespace {
 
+PortalWriteMode g_writeModeSetting = PortalWriteMode::Auto;   // --portal-write
+// Valor de Auto para VID_1430&PID_0150 (dispositivo de este equipo). Fijado tras medir (ver PROGRESS.md, Portal escrituras).
+constexpr PortalWriteMode kAutoDefault0150 = PortalWriteMode::ControlExact;
+
 // ---- P2: dispositivo Portal con hilo de E/S propio (paso directo, sin comandos propios) ----
 // Valores de retorno de Xenia (xam_input.cc): INVALID_PARAMETER, DEVICE_NOT_CONNECTED.
 // ERROR_BUSY (0xAA) para cola de escritura llena: valor no contrastado con Xenia [NV].
@@ -385,23 +393,46 @@ private:
             CloseHandle(f);
             return false;
         }
+        // Descriptor de interfaz y endpoints tal como están en la configuración cacheada (sin transferencias).
+        ImportLog::Get().Printf("PORTAL USB descriptor interfaz=%u clase=%02X subclase=%02X protocolo=%02X bNumEndpoints=%u alt=%u",
+                                d.bInterfaceNumber, d.bInterfaceClass, d.bInterfaceSubClass, d.bInterfaceProtocol,
+                                d.bNumEndpoints, d.bAlternateSetting);
         WINUSB_PIPE_INFORMATION in{}, out{};
         bool hasIn = false, hasOut = false;
         for (UCHAR i = 0; i < d.bNumEndpoints; ++i) {
             WINUSB_PIPE_INFORMATION c{};
-            if (!api_.queryPipe(u, d.bAlternateSetting, i, &c) || c.PipeType != kUsbInterruptPipe) continue;
+            if (!api_.queryPipe(u, d.bAlternateSetting, i, &c)) continue;
+            ImportLog::Get().Printf("PORTAL USB endpoint 0x%02X tipo=%d mps=%u intervalo=%u dir=%s",
+                                    c.PipeId, static_cast<int>(c.PipeType), c.MaximumPacketSize, c.Interval,
+                                    (c.PipeId & kUsbDirectionIn) ? "IN" : "OUT");
+            if (c.PipeType != kUsbInterruptPipe) continue;
             if (c.PipeId & kUsbDirectionIn) { if (!hasIn) { in = c; hasIn = true; } }
             else if (!hasOut) { out = c; hasOut = true; }
         }
-        if (!hasIn || !hasOut) {
-            LogOpenFailure(ERROR_NOT_FOUND, "interfaz USB 0 sin endpoint interrupt IN y OUT");
+        // Modo de escritura: explícito por CLI o automático según VID:PID.
+        PortalWriteMode mode = g_writeModeSetting;
+        if (mode == PortalWriteMode::Auto)
+            mode = HasPortalVidPid(path) ? kAutoDefault0150 : PortalWriteMode::Interrupt;   // insensible a mayusculas (ruta en minusculas)
+        const bool needsOut = mode == PortalWriteMode::Interrupt;
+        if (!hasIn || (needsOut && !hasOut)) {
+            LogOpenFailure(ERROR_NOT_FOUND, "interfaz USB 0 sin endpoint interrupt IN (y OUT en modo interrupt)");
+            api_.free(u);
+            CloseHandle(f);
+            return false;
+        }
+        if (mode != PortalWriteMode::Interrupt && !api_.controlTransfer) {
+            LogOpenFailure(ERROR_PROC_NOT_FOUND, "UsbK_ControlTransfer no exportada por libusbK.dll");
             api_.free(u);
             CloseHandle(f);
             return false;
         }
         UINT timeout = kPortalIoTimeoutMs;
-        if (!api_.setPipePolicy(u, in.PipeId, kPipeTransferTimeout, sizeof(timeout), &timeout) ||
-            !api_.setPipePolicy(u, out.PipeId, kPipeTransferTimeout, sizeof(timeout), &timeout)) {
+        bool policyOk = api_.setPipePolicy(u, in.PipeId, kPipeTransferTimeout, sizeof(timeout), &timeout);
+        if (policyOk && hasOut && mode == PortalWriteMode::Interrupt)
+            policyOk = api_.setPipePolicy(u, out.PipeId, kPipeTransferTimeout, sizeof(timeout), &timeout);
+        if (policyOk && mode != PortalWriteMode::Interrupt)   // control por defecto: pipe 0 (sin timeout no bloquea indefinidamente)
+            policyOk = api_.setPipePolicy(u, 0, kPipeTransferTimeout, sizeof(timeout), &timeout);
+        if (!policyOk) {
             LogOpenFailure(GetLastError(), "UsbK_SetPipePolicy fallo");
             api_.free(u);
             CloseHandle(f);
@@ -410,11 +441,15 @@ private:
         file_ = f;
         usb_ = u;
         inPipe_ = in.PipeId;
-        outPipe_ = out.PipeId;
+        outPipe_ = hasOut ? out.PipeId : 0;
+        writeMode_ = mode;
         lastOpenError_ = 0xFFFFFFFFu;
         connected = true;
-        ImportLog::Get().Printf("PORTAL USB abierto interfaz=0 in=0x%02X(mps=%u) out=0x%02X(mps=%u) timeout_ms=%u",
-                                in.PipeId, in.MaximumPacketSize, out.PipeId, out.MaximumPacketSize, kPortalIoTimeoutMs);
+        const char* modeName = mode == PortalWriteMode::Interrupt ? "interrupt" :
+                               mode == PortalWriteMode::ControlExact ? "control" : "control-pad32";
+        ImportLog::Get().Printf("PORTAL USB abierto interfaz=0 in=0x%02X(mps=%u) out=0x%02X(%s) modo_escritura=%s timeout_ms=%u",
+                                in.PipeId, in.MaximumPacketSize, outPipe_, hasOut ? "interrupt" : "sin endpoint OUT",
+                                modeName, kPortalIoTimeoutMs);
         return true;
     }
 
@@ -429,7 +464,7 @@ private:
         connected = false;   // primero: el juego ve la desconexion en el siguiente GetRaw/SetRaw
         if (usb_) {
             api_.abortPipe(usb_, inPipe_);
-            api_.abortPipe(usb_, outPipe_);
+            if (writeMode_ == PortalWriteMode::Interrupt) api_.abortPipe(usb_, outPipe_);
             api_.free(usb_);
             usb_ = nullptr;
         }
@@ -448,16 +483,39 @@ private:
         PortalPacket copy = w;
         UINT transferred = 0;
         const DWORD t0 = GetTickCount();
-        BOOL ok = api_.writePipe(usb_, outPipe_, copy.data, copy.len, &transferred, nullptr);
+        BOOL ok = FALSE;
+        uint32_t txLen = copy.len;
+        char via[96];
+        if (writeMode_ == PortalWriteMode::Interrupt) {
+            ok = api_.writePipe(usb_, outPipe_, copy.data, copy.len, &transferred, nullptr);
+            std::snprintf(via, sizeof(via), "via=interrupt ep=0x%02X", outPipe_);
+        } else {
+            // SET_REPORT (USB HID 1.11, 7.2.2): informe de salida, id 0, interfaz 0.
+            if (writeMode_ == PortalWriteMode::ControlPad32 && txLen < kPortalReportSize) {
+                std::memset(copy.data + txLen, 0, kPortalReportSize - txLen);   // relleno a ceros
+                txLen = kPortalReportSize;
+            }
+            WINUSB_SETUP_PACKET setup{};
+            setup.RequestType = 0x21;
+            setup.Request = 0x09;
+            setup.Value = 0x0200;
+            setup.Index = 0;
+            setup.Length = static_cast<USHORT>(txLen);
+            ULONG ctlTransferred = 0;
+            ok = api_.controlTransfer(usb_, setup, copy.data, txLen, &ctlTransferred, nullptr);
+            transferred = ctlTransferred;
+            std::snprintf(via, sizeof(via), "via=control setup=%02X/%02X/%04X/%04X/%04X",
+                          setup.RequestType, setup.Request, setup.Value, setup.Index, setup.Length);
+        }
         const DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-        const uint32_t shown = copy.len < kPortalReportSize ? copy.len : kPortalReportSize;
+        const uint32_t shown = txLen < kPortalReportSize ? txLen : kPortalReportSize;
         if (ok) {
-            ImportLog::Get().Printf("PORTAL USB dir=OUT ep=0x%02X len=%u data[%u]=%s res=OK bytes=%u t_ms=%lu",
-                                    outPipe_, copy.len, shown, HexOf(copy.data, shown).c_str(), transferred,
+            ImportLog::Get().Printf("PORTAL USB dir=OUT %s len=%u tx=%u data[%u]=%s res=OK bytes=%u t_ms=%lu",
+                                    via, copy.len, txLen, shown, HexOf(copy.data, shown).c_str(), transferred,
                                     static_cast<unsigned long>(GetTickCount() - t0));
         } else {
-            ImportLog::Get().Printf("PORTAL USB dir=OUT ep=0x%02X len=%u data[%u]=%s res=ERR(win32=%lu) t_ms=%lu",
-                                    outPipe_, copy.len, shown, HexOf(copy.data, shown).c_str(),
+            ImportLog::Get().Printf("PORTAL USB dir=OUT %s len=%u tx=%u data[%u]=%s res=ERR(win32=%lu) t_ms=%lu",
+                                    via, copy.len, txLen, shown, HexOf(copy.data, shown).c_str(),
                                     static_cast<unsigned long>(err), static_cast<unsigned long>(GetTickCount() - t0));
             if (IsDisconnectError(err)) CloseDevice("escritura");
         }
@@ -487,6 +545,7 @@ private:
     HANDLE file_ = INVALID_HANDLE_VALUE;
     KUSB_HANDLE usb_ = nullptr;
     UCHAR inPipe_ = 0, outPipe_ = 0;
+    PortalWriteMode writeMode_ = PortalWriteMode::Interrupt;   // resuelto al abrir
     DWORD lastOpenError_ = 0xFFFFFFFFu;
     std::mutex queueMu_;
     std::deque<PortalPacket> reports_, writes_;
@@ -520,6 +579,16 @@ static void LogRawOutcome(const char* name, uint64_t call, uint32_t ret, uint8_t
     ImportLog::Get().Printf("PORTAL %s OUT call=%llu ret=%08X len=%08X->%08X state=%04X->%04X buf[%u]=%s",
                             name, static_cast<unsigned long long>(call), ret, lenIn, lenOut,
                             stateIn, stateOut, n, hex);
+}
+
+bool SetPortalWriteMode(const char* text) {
+    if (!text) return false;
+    if (!std::strcmp(text, "auto")) g_writeModeSetting = PortalWriteMode::Auto;
+    else if (!std::strcmp(text, "interrupt")) g_writeModeSetting = PortalWriteMode::Interrupt;
+    else if (!std::strcmp(text, "control")) g_writeModeSetting = PortalWriteMode::ControlExact;
+    else if (!std::strcmp(text, "control-pad32")) g_writeModeSetting = PortalWriteMode::ControlPad32;
+    else return false;
+    return true;
 }
 
 static uint64_t PortalCallCount(bool get) {
