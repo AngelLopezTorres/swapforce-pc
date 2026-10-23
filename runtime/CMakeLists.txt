@@ -76,3 +76,19 @@ endif()
 add_custom_command(TARGET SwapForceRT POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DXC_BIN}/dxcompiler.dll" "$<TARGET_FILE_DIR:SwapForceRT>/dxcompiler.dll"
   COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DXC_BIN}/dxil.dll" "$<TARGET_FILE_DIR:SwapForceRT>/dxil.dll")
+
+# FFmpeg/libavcodec LGPL (A2): DLL cargadas DINAMICAMENTE con LoadLibrary (sin enlace). Las cabeceras solo se usan en compilacion y la
+# carpeta third_party_bin esta ignorada por git (descarga: THIRD_PARTY_NOTICES.md). Sin cabeceras el runtime compila y XMA queda en silencio.
+set(SWAPFORCE_FFMPEG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party_bin/ffmpeg" CACHE PATH "Carpeta con avcodec/avutil/swresample (DLL) e include/")
+if(EXISTS "${SWAPFORCE_FFMPEG_DIR}/include/libavcodec/avcodec.h")
+  target_include_directories(SwapForceRT PRIVATE "${SWAPFORCE_FFMPEG_DIR}/include")
+  target_compile_definitions(SwapForceRT PRIVATE SWAPFORCE_FFMPEG_HEADERS=1)
+  file(GLOB SWAPFORCE_FFMPEG_DLLS "${SWAPFORCE_FFMPEG_DIR}/*.dll")
+  foreach(dll ${SWAPFORCE_FFMPEG_DLLS})
+    add_custom_command(TARGET SwapForceRT POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${dll}" "$<TARGET_FILE_DIR:SwapForceRT>")
+  endforeach()
+  message(STATUS "FFmpeg (dinamico): cabeceras y DLL de ${SWAPFORCE_FFMPEG_DIR}")
+else()
+  message(STATUS "FFmpeg: sin cabeceras en ${SWAPFORCE_FFMPEG_DIR}; XMA solo silencio")
+endif()

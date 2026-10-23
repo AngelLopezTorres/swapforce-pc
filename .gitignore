@@ -79,3 +79,9 @@ m8_stall_stacks.txt
 analysis/function_extents.toml
 runtime/st_*.err
 runtime/run*/
+
+# --- Audio real (FFmpeg LGPL dinamico, descargado; NO se sube) ---
+runtime/third_party_bin/
+runtime/build_audio/
+runtime/vb_audio.cmd
+runtime/audio_runs/

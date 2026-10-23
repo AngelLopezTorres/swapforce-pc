@@ -29,7 +29,7 @@ namespace rt::gpu::d3d { extern uint32_t g_dumpEveryMs, g_dumpFromS, g_dumpForS;
 namespace rt::gpu::d3d { extern bool g_texSlowPath, g_texVerify, g_resolveSlowPath, g_resolveVerify, g_texMemoOff, g_resolveSync, g_noResolveShortcut, g_resolveNoDse, g_verifyShortcut, g_depthResolveSync, g_depthResolveVerify, g_gpuTiming, g_resolveStaging, g_diagNoReadback, g_depthResolveCs, g_lazyReadback, g_strictResolveSync, g_presentVerify, g_orderedWrites, g_eagerIssue, g_swapMarks; extern unsigned g_rowThreads, g_kickDraws, g_kickResolveDraws, g_diagSyncMask; extern bool g_windowNoActivate; extern bool g_asyncResolveWriter; }
 namespace rt::gpu::d3d { void SetDumpHlslHash(uint64_t hash); }
 int RunCpuSelfTest(uint64_t n, uint64_t seed);   // selftest\cpu_selftest.cpp
-namespace rt { extern bool g_binkProbeOn; extern bool g_importSerialize; extern bool g_noAudio; void AudioSummary(); void BinkProbeReport(); }
+namespace rt { extern bool g_binkProbeOn; extern bool g_importSerialize; extern bool g_noAudio; void AudioSummary(); void AudioFinish(); bool AudioParseArg(int argc, char** argv, int& i); bool AudioXmaTestFile(std::string& file, int& ch, int& rate); void BinkProbeReport(); }
 namespace rt { void ConfigureInputStartInjection(uint32_t afterCalls, uint32_t durationCalls); }
 namespace rt { void ConfigureXamUser0SignedIn(bool enabled, uint32_t afterCalls); }
 static std::string g_userdataOverride;
@@ -158,8 +158,9 @@ static bool XmaSelfTest(uint8_t* base) {
 
     uint64_t requestsBefore = rt::audio::XmaDecodeRequestCount();
     auto boundary = rt::audio::SubmitXmaDecode(first);
-    bool decoderBoundary = boundary == rt::audio::XmaDecodeBoundaryResult::BackendUnavailable &&
-                           !rt::audio::XmaDecoderBackendAvailable() &&
+    const bool backendAvail = rt::audio::XmaDecoderBackendAvailable();
+    bool decoderBoundary = (backendAvail ? boundary == rt::audio::XmaDecodeBoundaryResult::Queued
+                                         : boundary == rt::audio::XmaDecodeBoundaryResult::BackendUnavailable) &&
                            rt::audio::XmaDecodeRequestCount() == requestsBefore + 1;
 
     // El sumidero sintetico consume un paquete y hace visible el avance del
@@ -215,10 +216,12 @@ static bool XmaSelfTest(uint8_t* base) {
     bool ok = createStatus == 0 && first != 0 && layout && registers && decoderBoundary && silence && allocation && released && exhaustion;
     std::printf("xma-selftest create=%08X context=%08X array=%08X layout=%s registers=%s decode-boundary=%s silence=%s packets=%llu requests=%llu release=%s capacity=%u/%u -> %s\n",
                 createStatus, first, contextArray, layout ? "OK" : "FAIL", registers ? "OK" : "FAIL",
-                decoderBoundary ? "BACKEND_UNAVAILABLE" : "FAIL", silence ? "OK" : "FAIL",
+                decoderBoundary ? (backendAvail ? "QUEUED(libavcodec)" : "BACKEND_UNAVAILABLE") : "FAIL", silence ? "OK" : "FAIL",
                 static_cast<unsigned long long>(rt::audio::XmaSimulatedPacketCount()),
                 static_cast<unsigned long long>(rt::audio::XmaDecodeRequestCount()),
                 released ? "OK" : "FAIL", count, rt::audio::kXmaContextCount, ok ? "OK" : "FALLO");
+    std::string xf; int xch = 0, xrate = 0;
+    if (rt::AudioXmaTestFile(xf, xch, xrate)) ok = rt::audio::XmaDecodeSelfTest(base, xf, xch, xrate) && ok;   // A2: decodificacion real
     return ok;
 }
 
@@ -289,6 +292,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--dump-fb")) { rt::gpu::Cfg().dumpFb = true; rt::gpu::d3d::g_strictResolveSync = true; }   // M60: el volcado lee la memoria guest en XE_SWAP
         else if (!std::strcmp(argv[i], "--no-d3d")) rt::gpu::Cfg().noD3d = true;
         else if (!std::strcmp(argv[i], "--no-audio")) rt::g_noAudio = true;
+        else if (rt::AudioParseArg(argc, argv, i)) {}   // --audio=, --dump-audio, --xma-capture, --xma-file (audio_sink / xma)
         else if (!std::strcmp(argv[i], "--swap-interval") && i + 1 < argc) rt::gpu::Cfg().swapInterval = (uint32_t)std::strtoul(argv[++i], nullptr, 0) & 15;
         else if (!std::strcmp(argv[i], "--log-time")) rt::g_importLogTime = true;
         else if (!std::strcmp(argv[i], "--legacy-sleep")) { rt::g_legacySleep = true; rt::gpu::Cfg().legacyVsync = true; }
@@ -496,9 +500,11 @@ int main(int argc, char** argv) {
         rt::DumpSyncTrace();
         rt::BinkProbeReport();
         rt::AudioSummary();
+        rt::AudioFinish();
         if (rt::gpu::Cfg().shaderScan) rt::gpu::ScanShaderContainers("fin (timeout)");
-        log.Printf("XMA resumen: paquetes_sinteticos=%llu backend=sin_decodificador",
-                   static_cast<unsigned long long>(rt::audio::XmaSimulatedPacketCount()));
+        log.Printf("XMA resumen: paquetes_sinteticos=%llu backend=%s",
+                   static_cast<unsigned long long>(rt::audio::XmaSimulatedPacketCount()),
+                   rt::audio::XmaDecoderBackendAvailable() ? "libavcodec_xma2" : "sin_decodificador");
         rt::gpu::Stop();
         rt::gpu::Summary();
         rt::audio::StopXmaWorker();
@@ -510,6 +516,7 @@ int main(int argc, char** argv) {
     rt::perf::Stop();
     rt::gpu::Stop();
     rt::audio::StopXmaWorker();
+    rt::AudioFinish();
     rt::viewer::Stop();
     rt::gpu::Summary();
     rt::DumpSyncTrace();
