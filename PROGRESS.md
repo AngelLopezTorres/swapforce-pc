@@ -348,3 +348,56 @@ Comando: `build\SwapForceRT.exe --perf m8\perf_A.txt --timeout 120 --headless --
 2. Tirón único en la transición Bink 2 → escena posterior (~280 ms: creación de PSO 45 ms y de recursos de textura 62 ms); posible caché de PSO en disco (`ID3D12PipelineLibrary`) [no implementado].
 3. Spinlocks del kernel con `YieldProcessor` sin ceder al SO (riesgo bajo carga, ver arriba).
 4. `--perf` con muestreo suspende hilos cada ~1 ms: usar `--perf-nosample` para las cifras de fps.
+
+## Visor
+Propietario: gráficos (rama `live-view`, worktree `_wt_view`). Plan: `PLAN_VIEW.md`. Decisiones del coordinador: GetAsyncKeyState se mantiene (OR con la entrada del visor); sin token (bind a 127.0.0.1 y comprobación de Host/Origin); umbral de caída <= 3 % [NV] medido abajo.
+
+### Hitos (salida real de comandos)
+| Hito | Estado | Evidencia |
+|---|---|---|
+| Línea base del worktree | Compila (`vb_view.cmd`, EXIT=0) | `runtime\build_view\v\build_base.log` |
+| V0 `EncodeJpegRGBA` + `--selftest-jpeg` | ACEPTADO. Ejecutado | `selftest-jpeg: 1280x720 q=70 bytes=37020 enc_ms=16 SOI=1 EOI=1 wic_decode=1 PSNR=34.37 dB -> OK` (rc=0). Primera versión: PSNR 9.99 dB; causa: `SetPixelFormat` cambia 32bppBGR a 24bppBGR en el codificador JPEG de WIC; corregido con 24bppBGR y comprobación del formato devuelto. |
+| V1 servidor loopback, `/`, `/frame.jpg`, seguridad | ACEPTADO. Ejecutado (fotograma sintético `--viewer-synthetic`) | Escucha solo `127.0.0.1:8765`. `/frame.jpg` 200 `image/jpeg`, `FFD8`/`FFD9`, JFIF 640x360. `Host: evil.com` 403; POST 405; `/../runtime.log` 404; ruta desconocida 404; `/key` sin `--viewer-input` 404; cabecera de 64 KiB 431 y cierre; tercer cliente 503. Conexión a 192.168.0.25, 192.168.56.1, 10.9.0.1, 10.8.0.1 y 172.10.11.10: rechazada (curl código 7). |
+| V2 captura en `OnSwap`, filtro de ritmo, `try_lock` | Ejecutado con fotogramas del juego | `frame_02.jpg` (t=15 s) muestra el logotipo de Vicarious Visions con el ogro y la dama. `frame_01.jpg` (t=5 s) muestra letras metálicas en animación 3D (intro). Caída de fps: ver tabla. |
+| V3 `/stream` MJPEG y página `/` | Ejecutado con cliente Python | Sintético: 99 partes en 10 s (intervalo medio 102,6 ms; objetivo 100). Juego: 322 partes en 40 s (intervalo medio 124 ms) y 332 en 40 s (120 ms). Una medición previa con `curl` dio 44 partes en 10 s: causa no determinada [NV]. Revisión visual en navegador: NO realizada. |
+| V4 `/key` y botones | Ejecutado | `down=zz` 400; Origin/Host ajenos 403; `down=enter` 204; traza `INPUT user=0 buttons=0x0010`; `down=up,z` produce `0x1001`; cadena vacía y caducidad: `0x0000`. Ventana de 500 ms: el valor `0x0000` aparece tras 1,4 s sin latido; la precisión de 500 ms no se midió [NV]. |
+| V5 documentación y cierre | Este apartado. Parada limpia comprobada (`viewer: detenido`, `EXIT=4`) | Ver comprobaciones finales. |
+
+### Ejecución
+Compilar: `runtime\vb_view.cmd` (salida `runtime\build_view\out\SwapForceRT.exe`).
+
+Abrir el visor (siempre `--headless`; no abre ventana):
+```
+SwapForceRT.exe --headless --viewer 8765 --timeout 3600 --log <ruta>\runtime.log --gpu-log <ruta>\gpu.log --frames-dir <ruta>\frames > <ruta>\salida.txt
+```
+Opciones: `--viewer [puerto]` (defecto 8765, rango 1024-65535); `--viewer-fps N` (1-30, defecto 10); `--viewer-quality N` (10-95, defecto 70); `--viewer-scale 1|2|4` (defecto 1); `--viewer-input` (acepta `/key`; sin él, `/key` da 404); `--viewer-synthetic` (diagnóstico: patrón animado en lugar del juego).
+
+URL: `http://127.0.0.1:8765/` (página con vídeo MJPEG y teclas: flechas=DPAD, Enter=START, Z=A, X=B, Esc=BACK; requiere `--viewer-input` para que tenga efecto). Otros: `/frame.jpg` (JPEG, cabecera `X-Frame`), `/stream` (MJPEG `multipart/x-mixed-replace; boundary=frame`).
+
+### Caída de fps (criterio <= 3 %)
+Método: `--perf <f> --timeout 60 --headless --perf-nosample`; línea `PERF t=N ... fps_vdswap=X`; ventana común t=2..24 s (23 valores por ejecución). Cliente MJPEG de 40 s conectado en las ejecuciones B.
+| Ejecución | Media t=2..24 s (VdSwap/s) | Min | Max |
+|---|---|---|---|
+| A2 sin visor | 29,09 | 18,0 | 31,0 |
+| B2 visor + cliente | 28,74 | 7,0 | 30,1 |
+| A3 sin visor | 29,13 | 12,0 | 30,1 |
+| B3 visor + cliente | 29,22 | 16,0 | 31,0 |
+Media A 29,11; media B 28,98; **caída 0,44 %** (pares: A2-B2 1,20 %; A3-B3 -0,31 %). Cumple <= 3 %.
+Observaciones: (a) la presentación del juego tras t≈25 s varía entre ejecuciones con y sin visor (A1 sin visor: 0 fps en t=28-29 s; A2/A3: 18-29 fps; B1/B2: 7-18 fps; B3: 25-28 fps); no es un corte fijo a t≈26 s como indicaba el análisis previo, y no se usó esa zona. (b) Las medias de t=2..24 s incluyen dispersión (mínimos 2-18 fps). (c) Causa de la fase de baja presentación: [NV], fuera del alcance de V2.
+
+### Verificaciones de imagen y ritmo
+- Hashes de `/frame.jpg` durante el vídeo (t=5 s frente a t=15 s): distintos en B1 (`4e4b…` / `bd6d…`), B2 (`47f4…` / `032c…`) y B3 (`25a0…` / `a6f0…`).
+- En t=25 s y t=35 s, B1 y B3 entregan un fotograma blanco uniforme (15 027 bytes, mismo SHA-256 `2b1d…`); corresponde a la imagen blanca documentada en M8 (`PROGRESS.md`, «Rendimiento M8»).
+- Coste de codificación JPEG: 16 ms por fotograma 1280x720 (una muestra, V0) [NV en el juego]. El hilo de codificación está separado del hilo del CP.
+
+### Riesgos y problemas abiertos
+1. Sin autenticación: cualquier proceso local puede leer el visor; con `--viewer-input` puede inyectar teclas. Aceptado por decisión del coordinador (sin token).
+2. `GetAsyncKeyState` se combina por OR con la entrada del visor (decisión del usuario): las teclas globales del sistema siguen leyéndose cuando el visor está activo.
+3. `s.packet` de `XINPUT_STATE` no se incrementa (heredado): [NV] si el juego exige cambio de `packet` para aceptar la entrada del visor; la traza confirma los botones, no la reacción del juego.
+4. Fotogramas del juego: se sirven por HTTP solo mientras hay cliente; no se persisten en disco por el visor. Las pruebas guardaron fotogramas en `runtime\build_view\v\` (excluido por `.git/info/exclude`).
+5. Revisión visual en navegador (V3): pendiente del usuario.
+6. Cierre: el primer diseño podía no terminar al expirar `--timeout` (el hilo de aceptación bloqueado en `accept`). Corregido con `select()` de 200 ms; comprobado en B1, B2, B3, V4 (`viewer: detenido`, `EXIT=4`).
+7. Una medición con `curl` (44 partes en 10 s) no se reprodujo (99 con socket directo): causa [NV].
+
+### HANDOFF (propietario de `runtime\src\kernel\xam_input.cpp`, Codex)
+Cambio mínimo en `xam_input.cpp`: una línea `#include "viewer/viewer.h"` y, en `XamInputGetState`, `DWORD rc=ReadState(user,s); if (!rc && user==0) s.pad.buttons |= rt::viewer::Buttons();` (OR con la entrada local; `Buttons()` devuelve 0 sin `--viewer-input` o con latido caducado). No se modificó nada más de ese fichero. `XamInputGetCapabilities` no combina el visor (no se consideró necesario).

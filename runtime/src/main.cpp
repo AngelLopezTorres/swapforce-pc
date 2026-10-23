@@ -19,6 +19,7 @@
 #include "d3d12_backend.h"
 #include "ucode_hlsl.h"
 #include "perf.h"
+#include "viewer/viewer.h"
 #include "hid/portal.h"
 #include "audio/xma_context.h"
 
@@ -261,6 +262,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--no-audio")) rt::g_noAudio = true;
         else if (!std::strcmp(argv[i], "--bink-trace")) { rt::gpu::Cfg().binkTrace = true; rt::g_binkProbeOn = true; }
         else if (!std::strcmp(argv[i], "--headless")) rt::gpu::Cfg().headless = true;
+        else if (rt::viewer::ParseArg(argc, argv, i)) {}   // visor en vivo (PLAN_VIEW.md)
         else if (!std::strcmp(argv[i], "--tex-slow-path")) rt::gpu::d3d::g_texSlowPath = true;
         else if (!std::strcmp(argv[i], "--tex-verify")) rt::gpu::d3d::g_texVerify = true;
         else if (!std::strcmp(argv[i], "--resolve-slow-path")) rt::gpu::d3d::g_resolveSlowPath = true;
@@ -287,6 +289,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--dump-frames") && i + 1 < argc) rt::gpu::Cfg().dumpFrames = argv[++i];
         else if (!std::strcmp(argv[i], "--fb-frames") && i + 1 < argc) rt::gpu::Cfg().fbFrames = argv[++i];
         else if (!std::strcmp(argv[i], "--selftest-pm4")) return rt::gpu::Pm4SelfTest();
+        else if (!std::strcmp(argv[i], "--selftest-jpeg")) return rt::viewer::RunJpegSelfTest();
         else if (!std::strcmp(argv[i], "--selftest-cpu")) {   // --selftest-cpu [N=10000] [semilla=1]
             uint64_t n = 10000, seed = 1;
             if (i + 1 < argc && argv[i + 1][0] != '-') n = std::strtoull(argv[++i], nullptr, 0);
@@ -421,6 +424,7 @@ int main(int argc, char** argv) {
     }
     rt::gpu::Start();
     if (!perfOut.empty()) rt::perf::Start(perfOut.c_str());
+    rt::viewer::Start(rt::viewer::Cfg());
     log.Printf("start _xstart 0x82F422E8");
     th->Start();
     th->Resume();
@@ -437,12 +441,14 @@ int main(int argc, char** argv) {
         rt::gpu::Summary();
         rt::audio::StopXmaWorker();
         log.Summary();
+        rt::viewer::Stop();
         std::fflush(nullptr);
         ExitProcess(4);
     }
     rt::perf::Stop();
     rt::gpu::Stop();
     rt::audio::StopXmaWorker();
+    rt::viewer::Stop();
     rt::gpu::Summary();
     log.Summary();
     return th->ExitCode();

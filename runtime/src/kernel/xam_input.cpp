@@ -4,6 +4,7 @@
 
 #include "guest_abi.h"
 #include "import_log.h"
+#include "viewer/viewer.h"
 
 using namespace rt;
 
@@ -62,7 +63,7 @@ void StorePad(uint8_t* base, uint32_t at, const Gamepad& p) {
 GUEST_IMPORT_IMPL(XamInputGetState) {
     ImportScope sc("XamInputGetState",ctx,base);
     State s{}; uint32_t user=ctx.r3.u32&0xFF;
-    DWORD rc=ReadState(user,s);
+    DWORD rc=ReadState(user,s); if (!rc && user==0) s.pad.buttons |= rt::viewer::Buttons();   // visor en vivo: OR con la entrada local
     if (!rc && ctx.r5.u32) { P32(base,ctx.r5.u32,s.packet); StorePad(base,ctx.r5.u32+4,s.pad); }
     if (!rc) ImportLog::Get().Printf("INPUT user=%u buttons=0x%04X",user,s.pad.buttons);
     SetRet(ctx,rc);
