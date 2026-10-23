@@ -76,3 +76,6 @@ runtime/vb_rebuild.cmd
 runtime/build_codex_*/
 runtime/build_verify/
 m8_stall_stacks.txt
+analysis/function_extents.toml
+runtime/st_*.err
+runtime/run*/
