@@ -8,8 +8,12 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdio>
+#include <cstring>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <sstream>
+#include <thread>
 #include <vector>
 
 #include "guest_abi.h"
@@ -27,6 +31,8 @@ using UsbKQueryInterfaceSettingsFn = BOOL(WINAPI*)(KUSB_HANDLE, UCHAR, PUSB_INTE
 using UsbKQueryPipeFn = BOOL(WINAPI*)(KUSB_HANDLE, UCHAR, UCHAR, PWINUSB_PIPE_INFORMATION);
 using UsbKSetPipePolicyFn = BOOL(WINAPI*)(KUSB_HANDLE, UCHAR, UINT, UINT, PVOID);
 using UsbKReadPipeFn = BOOL(WINAPI*)(KUSB_HANDLE, UCHAR, PUCHAR, UINT, PUINT, LPOVERLAPPED);
+using UsbKWritePipeFn = BOOL(WINAPI*)(KUSB_HANDLE, UCHAR, PUCHAR, UINT, PUINT, LPOVERLAPPED);
+using UsbKAbortPipeFn = BOOL(WINAPI*)(KUSB_HANDLE, UCHAR);
 
 struct LibUsbKApi {
     HMODULE dll = nullptr;
@@ -37,6 +43,8 @@ struct LibUsbKApi {
     UsbKQueryPipeFn queryPipe = nullptr;
     UsbKSetPipePolicyFn setPipePolicy = nullptr;
     UsbKReadPipeFn readPipe = nullptr;
+    UsbKWritePipeFn writePipe = nullptr;
+    UsbKAbortPipeFn abortPipe = nullptr;
 
     bool Load() {
         dll = LoadLibraryExW(L"libusbK.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -48,7 +56,9 @@ struct LibUsbKApi {
         queryPipe = reinterpret_cast<UsbKQueryPipeFn>(GetProcAddress(dll, "UsbK_QueryPipe"));
         setPipePolicy = reinterpret_cast<UsbKSetPipePolicyFn>(GetProcAddress(dll, "UsbK_SetPipePolicy"));
         readPipe = reinterpret_cast<UsbKReadPipeFn>(GetProcAddress(dll, "UsbK_ReadPipe"));
-        return initialize && free && claimInterface && queryInterfaceSettings && queryPipe && setPipePolicy && readPipe;
+        writePipe = reinterpret_cast<UsbKWritePipeFn>(GetProcAddress(dll, "UsbK_WritePipe"));
+        abortPipe = reinterpret_cast<UsbKAbortPipeFn>(GetProcAddress(dll, "UsbK_AbortPipe"));
+        return initialize && free && claimInterface && queryInterfaceSettings && queryPipe && setPipePolicy && readPipe && writePipe && abortPipe;
     }
 
     ~LibUsbKApi() { if (dll) FreeLibrary(dll); }
@@ -255,16 +265,324 @@ static void LogRawCall(const char* name, PPCContext& ctx, uint8_t* base) {
     }
 }
 
+namespace {
+
+// ---- P2: dispositivo Portal con hilo de E/S propio (paso directo, sin comandos propios) ----
+// Valores de retorno de Xenia (xam_input.cc): INVALID_PARAMETER, DEVICE_NOT_CONNECTED.
+// ERROR_BUSY (0xAA) para cola de escritura llena: valor no contrastado con Xenia [NV].
+constexpr uint32_t kPortalOk = 0;
+constexpr uint32_t kPortalInvalidParameter = 0x57;
+constexpr uint32_t kPortalNotConnected = 0x48F;
+constexpr uint32_t kPortalBusy = 0xAA;
+constexpr uint32_t kPortalReportSize = 0x20;      // kPortalBufferSize de Xenia (portal.h)
+constexpr DWORD kPortalIoTimeoutMs = 100;          // timeout = 100 de Xenia (hardware_portal.h)
+constexpr size_t kPortalReportCap = 64;
+constexpr size_t kPortalWriteCap = 16;
+
+struct PortalPacket { uint32_t len = 0; uint8_t data[kPortalReportSize]{}; };
+
+bool IsDisconnectError(DWORD e) {
+    return e == ERROR_DEVICE_NOT_CONNECTED || e == ERROR_GEN_FAILURE ||
+           e == ERROR_NO_SUCH_DEVICE || e == ERROR_FILE_NOT_FOUND;
+}
+
+std::string HexOf(const uint8_t* p, uint32_t n) {
+    static const char digits[] = "0123456789ABCDEF";
+    std::string s;
+    for (uint32_t i = 0; i < n; ++i) { s.push_back(digits[p[i] >> 4]); s.push_back(digits[p[i] & 15]); }
+    return s;
+}
+
+class PortalIo {
+public:
+    static PortalIo& Get() {
+        static PortalIo* io = [] { auto* p = new PortalIo(); p->Start(); return p; }();  // sin destructor: el proceso termina sin unir hilos
+        return *io;
+    }
+
+    std::atomic<bool> connected{false};
+    std::mutex readMu;          // equivalente al lock_ de Portal::Read de Xenia
+    uint32_t prevStatus = 0;    // guardado bajo readMu
+
+    bool PopReport(PortalPacket& out) {
+        std::lock_guard<std::mutex> lock(queueMu_);
+        if (reports_.empty()) return false;
+        out = reports_.front();
+        reports_.pop_front();
+        return true;
+    }
+
+    bool PushWrite(const uint8_t* data, uint32_t len) {
+        std::lock_guard<std::mutex> lock(queueMu_);
+        if (writes_.size() >= kPortalWriteCap) return false;
+        PortalPacket p;
+        p.len = len;
+        std::memcpy(p.data, data, len);   // copia antes de devolver el control al juego
+        writes_.push_back(p);
+        return true;
+    }
+
+private:
+    void Start() { std::thread([this] { Run(); }).detach(); }
+
+    bool PopWrite(PortalPacket& out) {
+        std::lock_guard<std::mutex> lock(queueMu_);
+        if (writes_.empty()) return false;
+        out = writes_.front();
+        writes_.pop_front();
+        return true;
+    }
+
+    void PushReport(const PortalPacket& p) {
+        std::lock_guard<std::mutex> lock(queueMu_);
+        if (reports_.size() >= kPortalReportCap) { reports_.pop_front(); ++droppedReports_; }
+        reports_.push_back(p);
+    }
+
+    void Run() {
+        if (!api_.Load()) {
+            ImportLog::Get().Printf("PORTAL USB libusbK.dll o exportaciones no disponibles; Portal desconectado");
+            for (;;) Sleep(1000);
+        }
+        DWORD lastIdleLog = GetTickCount();
+        uint32_t idle = 0;
+        for (;;) {
+            if (!usb_ && !OpenDevice()) { Sleep(500); continue; }
+            PortalPacket w;
+            while (usb_ && PopWrite(w)) DoWrite(w);
+            if (!usb_) continue;
+            DoRead(idle);
+            DWORD now = GetTickCount();
+            if (now - lastIdleLog >= 1000) {
+                if (idle) ImportLog::Get().Printf("PORTAL USB IN sin datos (timeout) x%u en ~1 s", idle);
+                idle = 0;
+                lastIdleLog = now;
+            }
+        }
+    }
+
+    bool OpenDevice() {
+        std::wstring path;
+        DWORD err = ERROR_SUCCESS;
+        if (!FindPortalPath(path, err)) {
+            LogOpenFailure(err ? err : 0xFFFFu, "dispositivo VID_1430&PID_0150 no encontrado");
+            return false;
+        }
+        HANDLE f = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, nullptr);
+        if (f == INVALID_HANDLE_VALUE) { LogOpenFailure(GetLastError(), "CreateFile fallo"); return false; }
+        KUSB_HANDLE u = nullptr;
+        USB_INTERFACE_DESCRIPTOR d{};
+        if (!api_.initialize(f, &u) || !api_.queryInterfaceSettings(u, 0, &d)) {
+            LogOpenFailure(GetLastError(), "UsbK_Initialize/QueryInterfaceSettings fallo");
+            if (u) api_.free(u);
+            CloseHandle(f);
+            return false;
+        }
+        if (d.bInterfaceNumber != 0 && (!api_.claimInterface(u, 0, FALSE) || !api_.queryInterfaceSettings(u, 0, &d))) {
+            LogOpenFailure(GetLastError(), "no se pudo seleccionar la interfaz USB 0");
+            api_.free(u);
+            CloseHandle(f);
+            return false;
+        }
+        WINUSB_PIPE_INFORMATION in{}, out{};
+        bool hasIn = false, hasOut = false;
+        for (UCHAR i = 0; i < d.bNumEndpoints; ++i) {
+            WINUSB_PIPE_INFORMATION c{};
+            if (!api_.queryPipe(u, d.bAlternateSetting, i, &c) || c.PipeType != kUsbInterruptPipe) continue;
+            if (c.PipeId & kUsbDirectionIn) { if (!hasIn) { in = c; hasIn = true; } }
+            else if (!hasOut) { out = c; hasOut = true; }
+        }
+        if (!hasIn || !hasOut) {
+            LogOpenFailure(ERROR_NOT_FOUND, "interfaz USB 0 sin endpoint interrupt IN y OUT");
+            api_.free(u);
+            CloseHandle(f);
+            return false;
+        }
+        UINT timeout = kPortalIoTimeoutMs;
+        if (!api_.setPipePolicy(u, in.PipeId, kPipeTransferTimeout, sizeof(timeout), &timeout) ||
+            !api_.setPipePolicy(u, out.PipeId, kPipeTransferTimeout, sizeof(timeout), &timeout)) {
+            LogOpenFailure(GetLastError(), "UsbK_SetPipePolicy fallo");
+            api_.free(u);
+            CloseHandle(f);
+            return false;
+        }
+        file_ = f;
+        usb_ = u;
+        inPipe_ = in.PipeId;
+        outPipe_ = out.PipeId;
+        lastOpenError_ = 0xFFFFFFFFu;
+        connected = true;
+        ImportLog::Get().Printf("PORTAL USB abierto interfaz=0 in=0x%02X(mps=%u) out=0x%02X(mps=%u) timeout_ms=%u",
+                                in.PipeId, in.MaximumPacketSize, out.PipeId, out.MaximumPacketSize, kPortalIoTimeoutMs);
+        return true;
+    }
+
+    void LogOpenFailure(DWORD err, const char* what) {
+        if (err == lastOpenError_) return;   // un aviso por cada cambio de error
+        lastOpenError_ = err;
+        ImportLog::Get().Printf("PORTAL USB apertura fallida: %s (win32=%lu); reintento cada 500 ms", what,
+                                static_cast<unsigned long>(err));
+    }
+
+    void CloseDevice(const char* why) {
+        connected = false;   // primero: el juego ve la desconexion en el siguiente GetRaw/SetRaw
+        if (usb_) {
+            api_.abortPipe(usb_, inPipe_);
+            api_.abortPipe(usb_, outPipe_);
+            api_.free(usb_);
+            usb_ = nullptr;
+        }
+        if (file_ != INVALID_HANDLE_VALUE) { CloseHandle(file_); file_ = INVALID_HANDLE_VALUE; }
+        size_t dropped = 0;
+        {
+            std::lock_guard<std::mutex> lock(queueMu_);
+            dropped = writes_.size();
+            writes_.clear();
+        }
+        ImportLog::Get().Printf("PORTAL USB cierre motivo=%s escrituras_descartadas=%llu", why,
+                                static_cast<unsigned long long>(dropped));
+    }
+
+    void DoWrite(const PortalPacket& w) {
+        PortalPacket copy = w;
+        UINT transferred = 0;
+        const DWORD t0 = GetTickCount();
+        BOOL ok = api_.writePipe(usb_, outPipe_, copy.data, copy.len, &transferred, nullptr);
+        const DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+        const uint32_t shown = copy.len < kPortalReportSize ? copy.len : kPortalReportSize;
+        if (ok) {
+            ImportLog::Get().Printf("PORTAL USB dir=OUT ep=0x%02X len=%u data[%u]=%s res=OK bytes=%u t_ms=%lu",
+                                    outPipe_, copy.len, shown, HexOf(copy.data, shown).c_str(), transferred,
+                                    static_cast<unsigned long>(GetTickCount() - t0));
+        } else {
+            ImportLog::Get().Printf("PORTAL USB dir=OUT ep=0x%02X len=%u data[%u]=%s res=ERR(win32=%lu) t_ms=%lu",
+                                    outPipe_, copy.len, shown, HexOf(copy.data, shown).c_str(),
+                                    static_cast<unsigned long>(err), static_cast<unsigned long>(GetTickCount() - t0));
+            if (IsDisconnectError(err)) CloseDevice("escritura");
+        }
+    }
+
+    void DoRead(uint32_t& idle) {
+        uint8_t buf[kPortalReportSize]{};
+        UINT n = 0;
+        BOOL ok = api_.readPipe(usb_, inPipe_, buf, sizeof(buf), &n, nullptr);
+        if (ok) {
+            if (n == 0) { ++idle; return; }
+            PortalPacket p;
+            p.len = n;
+            std::memcpy(p.data, buf, n);
+            PushReport(p);
+            ImportLog::Get().Printf("PORTAL USB dir=IN ep=0x%02X len=%u data[%u]=%s res=OK", inPipe_, n, n,
+                                    HexOf(buf, n).c_str());
+            return;
+        }
+        const DWORD err = GetLastError();
+        if (err == ERROR_SEM_TIMEOUT || err == ERROR_TIMEOUT) { ++idle; return; }
+        ImportLog::Get().Printf("PORTAL USB dir=IN ep=0x%02X res=ERR(win32=%lu)", inPipe_, static_cast<unsigned long>(err));
+        if (IsDisconnectError(err)) CloseDevice("lectura");
+    }
+
+    LibUsbKApi api_;
+    HANDLE file_ = INVALID_HANDLE_VALUE;
+    KUSB_HANDLE usb_ = nullptr;
+    UCHAR inPipe_ = 0, outPipe_ = 0;
+    DWORD lastOpenError_ = 0xFFFFFFFFu;
+    std::mutex queueMu_;
+    std::deque<PortalPacket> reports_, writes_;
+    uint64_t droppedReports_ = 0;
+};
+
+} // namespace
+
+// Lectura guest validada (no desreferencia direcciones fuera del bloque comprometido).
+static bool GuestReadable(uint8_t* base, uint32_t a, uint32_t n) {
+    if (a < 0x10000u || a > 0xFFFFFFF0u) return false;
+    MEMORY_BASIC_INFORMATION region{};
+    if (!VirtualQuery(base + a, &region, sizeof(region)) || region.State != MEM_COMMIT ||
+        (region.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return false;
+    uintptr_t available = reinterpret_cast<uintptr_t>(region.BaseAddress) + region.RegionSize -
+                          reinterpret_cast<uintptr_t>(base + a);
+    return available >= n;
+}
+
+// P1: registra el resultado observado tras la llamada (sin cambiar el valor devuelto).
+static void LogRawOutcome(const char* name, uint64_t call, uint32_t ret, uint8_t* base,
+                          uint32_t lenPtr, uint32_t statePtr, uint32_t bufPtr,
+                          uint32_t lenIn, uint32_t stateIn) {
+    const uint32_t lenOut = GuestReadable(base, lenPtr, 4) ? G32(base, lenPtr) : 0xFFFFFFFFu;
+    const uint32_t stateOut = GuestReadable(base, statePtr, 2) ? G16(base, statePtr) : 0xFFFFu;
+    char hex[65]{};
+    unsigned n = 0;
+    if (GuestReadable(base, bufPtr, 32)) {
+        for (; n < 32; ++n) std::snprintf(hex + n * 2, sizeof(hex) - n * 2, "%02X", base[bufPtr + n]);
+    }
+    ImportLog::Get().Printf("PORTAL %s OUT call=%llu ret=%08X len=%08X->%08X state=%04X->%04X buf[%u]=%s",
+                            name, static_cast<unsigned long long>(call), ret, lenIn, lenOut,
+                            stateIn, stateOut, n, hex);
+}
+
+static uint64_t PortalCallCount(bool get) {
+    static std::atomic<uint64_t> getCalls{0}, setCalls{0};
+    return (get ? getCalls : setCalls).fetch_add(1) + 1;
+}
+
 void XamInputNonControllerGetRaw(PPCContext& ctx, uint8_t* base) {
+    const uint64_t call = PortalCallCount(true);
     LogRawCall("GetRaw", ctx, base);
-    // ABI y formato del buffer guest pendientes de documentar; no se adivinan punteros guest.
-    SetRet(ctx, 0xC00000BB); // STATUS_NOT_SUPPORTED
+    const uint32_t statePtr = ctx.r3.u32, lenPtr = ctx.r4.u32, bufPtr = ctx.r5.u32;
+    const bool sampled = call <= 8 || (call & 1023) == 0;
+    PortalIo& io = PortalIo::Get();
+    uint32_t ret = kPortalOk;
+    uint32_t lenIn = 0xFFFFFFFFu, stateIn = 0xFFFFu;
+    // Orden de validaciones como en Xenia (XamInputNonControllerGetRawEx_entry).
+    if (!statePtr || !lenPtr || !bufPtr || !GuestReadable(base, lenPtr, 4) || !GuestReadable(base, statePtr, 2)) {
+        ret = kPortalInvalidParameter;
+    } else {
+        const uint32_t cap = G32(base, lenPtr);
+        lenIn = cap;
+        stateIn = G16(base, statePtr);
+        if (cap == 0 || cap > kPortalReportSize) {
+            ret = kPortalInvalidParameter;
+        } else if (!io.connected) {
+            ret = kPortalNotConnected;   // Xenia: sin portal no escribe salidas
+        } else if (!GuestReadable(base, bufPtr, cap)) {
+            ret = kPortalInvalidParameter;
+        } else {
+            std::lock_guard<std::mutex> lock(io.readMu);
+            PortalPacket r;
+            uint32_t n = 0;
+            if (io.PopReport(r)) {
+                n = r.len < cap ? r.len : cap;
+                std::memcpy(base + bufPtr, r.data, n);
+            }
+            // Regla de Xenia: state = (estado anterior == estado actual), ambos OK.
+            const uint16_t state = io.prevStatus == kPortalOk ? 1 : 0;
+            io.prevStatus = kPortalOk;
+            P32(base, lenPtr, n);
+            P16(base, statePtr, state);
+        }
+    }
+    SetRet(ctx, ret);
+    if (sampled) LogRawOutcome("GetRaw", call, ret, base, lenPtr, statePtr, bufPtr, lenIn, stateIn);
 }
 
 void XamInputNonControllerSetRaw(PPCContext& ctx, uint8_t* base) {
+    const uint64_t call = PortalCallCount(false);
     LogRawCall("SetRaw", ctx, base);
-    // Escrituras USB desde el juego quedan deshabilitadas; el ABI del export es [NV].
-    SetRet(ctx, 0xC00000BB); // STATUS_NOT_SUPPORTED
+    const uint32_t len = ctx.r3.u32, bufPtr = ctx.r4.u32;
+    PortalIo& io = PortalIo::Get();
+    uint32_t ret = kPortalOk;
+    if (!bufPtr || len == 0 || len > kPortalReportSize || !GuestReadable(base, bufPtr, len)) {
+        ret = kPortalInvalidParameter;
+    } else if (!io.connected) {
+        ret = kPortalNotConnected;
+    } else if (!io.PushWrite(base + bufPtr, len)) {
+        ret = kPortalBusy;   // cola llena (16): no se descarta ni reordena ningun paquete
+    }
+    // Paso directo: los bytes se copian tal cual y los escribe el hilo de E/S (registrado como PORTAL USB dir=OUT).
+    SetRet(ctx, ret);
+    if (call <= 8 || (call & 1023) == 0) LogRawOutcome("SetRaw", call, ret, base, 0, 0, bufPtr, len, 0);
 }
 
 } // namespace rt::hid
