@@ -28,7 +28,7 @@ namespace {
 
 // Mascara XINPUT_GAMEPAD (xam_input.cpp)
 constexpr uint16_t kUp = 0x0001, kDown = 0x0002, kLeft = 0x0004, kRight = 0x0008;
-constexpr uint16_t kStart = 0x0010, kBack = 0x0020, kA = 0x1000, kB = 0x2000;
+constexpr uint16_t kStart = 0x0010, kBack = 0x0020, kA = 0x1000, kB = 0x2000, kXb = 0x4000, kYb = 0x8000;
 constexpr int64_t kKeyTimeoutMs = 500;     // sin latido en 500 ms -> botones a 0
 constexpr int64_t kDemandMs = 3000;        // sin peticiones en 3 s -> no se codifica
 constexpr size_t kMaxHeader = 4096;
@@ -140,6 +140,8 @@ bool ParseKeys(const std::string& q, uint16_t& mask) {
             else if (t == "esc") mask |= kBack;
             else if (t == "z") mask |= kA;
             else if (t == "x") mask |= kB;
+            else if (t == "y") mask |= kYb;
+            else if (t == "xb") mask |= kXb;
             else return false;
         }
         if (comma == std::string::npos) break;
@@ -193,7 +195,7 @@ void HandleClient(SOCKET s) {
             "<title>SwapForce visor</title><body style='margin:0;background:#000;display:flex;justify-content:center'>"
             "<img id=v src='/stream' style='max-width:100%;height:auto'>"
             "<script>"
-            "const K={ArrowUp:'up',ArrowDown:'down',ArrowLeft:'left',ArrowRight:'right',Enter:'enter',Escape:'esc',KeyZ:'z',Space:'z',KeyX:'x'};"
+            "const K={ArrowUp:'up',ArrowDown:'down',ArrowLeft:'left',ArrowRight:'right',Enter:'enter',Escape:'esc',KeyZ:'z',Space:'z',KeyX:'x',KeyC:'y',KeyV:'xb',Backspace:'x'};"
             "const act=new Set();"
             "function send(){const q=[...act].join(',');fetch('/key?down='+q,{method:'GET',cache:'no-store'}).catch(()=>{});}"
             "addEventListener('keydown',e=>{const k=K[e.code];if(k){act.add(k);send();e.preventDefault();}});"
