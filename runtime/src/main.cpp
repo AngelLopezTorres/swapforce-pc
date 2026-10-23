@@ -111,7 +111,8 @@ static bool XamPortalExportSelfTest(uint8_t* base) {
         if (!thunk) return false;
         ctx = PPCContext{};
         thunk(ctx, base);
-        return ctx.r3.u32 == 0xC00000BB;
+        // Llamada con punteros nulos: validacion de Xenia (XamInputNonControllerGetRawEx_entry) -> INVALID_PARAMETER (0x57).
+        return ctx.r3.u32 == 0x57;
     };
 
     bool ok = resolve(0x4A1, 0x830A9EE0, 0) && resolve(0x4A2, 0x830A9EE4, 0) &&

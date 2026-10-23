@@ -359,6 +359,40 @@ Referencias descargadas a `runtime\ref\` (no se distribuyen): Xenia `ppc_opcode_
 - Compilación aislada: `& .\\tools\\vsenv.cmd cmake --build build_codex_round7 --parallel 8` desde `runtime/`: código 0. `--headless --selftest-gpu build_codex_round6/r6_baseline/userdata/shaders`: código 0, PM4=1, color `(200,100,50)`, `shader_fail=0`, `pso_fail=0`. `git diff --check`: código 0.
 - Ejecución final `--headless --no-audio --dump-frames 850,1000,1200 --timeout 70`, con userdata/log/salida/frames propios en `runtime/build_codex_round7/r7_final_title/`: código 4 por timeout; 1956 frames, 809012 draws correctos, 72 omitidos, 0 `shader_fail`, 0 `pso_fail`, 0 `removed`, al menos 6500 resolves de profundidad escritos y 0 pak nuevos tras el vídeo. PNG 850, 1000 y 1200 abiertos: logo legible «SKYLANDERS SWAP FORCE» sobre cielo azul y nubes, «PRESS START» y copyright; hay leves cambios de fondo entre frames. SHA-256 respectivamente `C24CA3DA93CB753359AECCD83980A5351DCD387230E2BEE7AC26CC1E3F553C2E`, `605CC8A5ECEF48CEAF75262B445B91AEB894207F7D4E76C9A6A176CB69B745C7` y `F1711B5E286938C82AED1DDDDC5B114BB298BD5E543D77540A73AE38997F76AC`. Siguiente bloqueo: transición lógica posterior a «PRESS START»; no se atribuye a GPU, XAM o entrada sin una traza que lo demuestre.
 
+### Codex ronda 8 — Portal (2026-10-23, PLAN_PORTAL.md P1-P6)
+
+Autorización: `TAREA_CODEX.md` ronda 8 (escrituras solo como paso directo de los bytes que envía el juego en SetRaw). No se envió ningún comando propio al Portal; los selftests solo enumeran, abren y leen. Compilación en `runtime\build_portal` (no se tocó `build_live`, ni `ppc_gen`, ni `tools\XenonRecomp`). Instancias propias cerradas al terminar.
+
+**Firma (fuentes Xenia, verificadas en `runtime\ref\xam_input.cc`/`portal_canary.cc`/`hwportal_canary.cc` y en `/tmp/cn`):**
+- `XamInputNonControllerGetRaw(state_ptr r3, length_ptr r4, buffer_ptr r5)` → `GetRawEx(5, …)`. `XamInputNonControllerSetRaw(length r3, buffer_ptr r4)` → `SetRawEx(5, …)`.
+- Validación: punteros nulos o longitud 0 / >0x20 → `X_ERROR_INVALID_PARAMETER` (0x57). Sin portal → `X_ERROR_DEVICE_NOT_CONNECTED` (0x48F; 1167 decimal = ERROR_DEVICE_NOT_CONNECTED).
+- `state` (u16) = `previous_status_ == status`; `previous_status_` se actualiza en cada lectura conectada. Lectura con timeout = éxito con 0 bytes. Endpoints en Xenia: IN 0x81, OUT 0x02, timeout 100 ms (`hardware_portal.h`). Xenia lista 1430:1F17 y 24C6:FA00; el dispositivo de este equipo es 1430:0150.
+- Trazas P1 (`build_portal\run_p1\runtime.log`, 8 llamadas sampleadas con salida): r3 = `703BFCD4` (state), r4 = `703BFCD0` (len = `00000020`), r5 = `703BFCE0` (buffer). SetRaw no se invocó en la traza P1.
+
+**Cambios (rutas permitidas):**
+- `src\hid\portal.cpp`: clase `PortalIo` con hilo de E/S propio (un solo hilo: lectura IN 0x81 con timeout 100 ms y escritura OUT con timeout 100 ms, reapertura cada 500 ms, sin `ppc_gen`). Cola de informes (64, descarte del más antiguo contado) y cola de escrituras (16). GetRaw y SetRaw validan como Xenia; GetRaw nunca hace E/S. Registro: `PORTAL USB abierto|dir=IN|dir=OUT|cierre|apertura fallida`, con len, primeros 32 B en hex y resultado win32.
+- `src\hid\portal.cpp` `UsbK_WritePipe` y `UsbK_AbortPipe` añadidos a la carga de libusbK.dll.
+- `src\main.cpp`: el selftest de dispatch espera `0x57` (validación de punteros nulos) en lugar de `0xC00000BB`, porque el stub ya no devuelve NOT_SUPPORTED.
+
+**Desviaciones respecto a Xenia (documentadas):**
+1. SetRaw es asíncrono: encola la copia de los bytes y devuelve 0 si el portal está conectado; el resultado real de la escritura se registra como `PORTAL USB dir=OUT … res=`. Xenia devuelve el estado de la escritura en la misma llamada. Motivo: no bloquear el hilo guest (TAREA_CODEX). Efecto sobre el juego: [NV].
+2. Endpoint OUT: el descriptor del dispositivo expone un único endpoint interrupt OUT, `0x01` (`out=0x01(mps=32)` en el log), no `0x02` como en Xenia. Se usa el del descriptor [verificado en log].
+3. `ERROR_BUSY` (0xAA) cuando la cola de escrituras está llena: valor no contrastado con Xenia [NV].
+
+**Resultados medidos:**
+- `--selftest-portal --headless` (código 0): `dispatch=OK`, `device=present open=yes interface0=yes interrupt-in=yes read=complete bytes=32 endpoint=0x81 → OK`.
+- P2: en la ejecución de juego con portal conectado, GetRaw devolvió 0 (`ret=00000000 state=0000->0001`) desde la llamada 2; la llamada 1 devolvió 0x48F porque el hilo aún no había abierto el dispositivo (carrera de arranque, no corregida). Sin portal no se ejecutó: requiere desconectarlo (acción del usuario) [NV].
+- IN (ep 0x81): 4913 transferencias OK de 32 B. Cabecera `53 00 00 00 00 NN` con contador NN creciente (`0C`, `0D`, …); el contador es el único campo que cambia observado [NV: significado no contrastado].
+- OUT (ep 0x01), SetRaw del juego `len=4`, datos `0B 14 52 00`: 464 transferencias con `res=ERR`; 463 con `win32=121` (ERROR_SEM_TIMEOUT, 100 ms), 1 con `win32=31` (ERROR_GEN_FAILURE) que cerró y reabrió el dispositivo (`PORTAL USB cierre motivo=escritura`, `abierto` posterior). Ninguna escritura OUT completó con `res=OK`. Causa: [NV]. No se envió ningún comando propio para diagnosticarla.
+- P3: cada OUT registrado procede de una llamada SetRaw aceptada (la escritura solo se encola desde SetRaw). No hay contador global de SetRaw en el log (solo muestras de las primeras 8 y cada 1024); la comprobación 1:1 queda [NV].
+- P4: reapertura automática sin reiniciar el proceso, tras el error de escritura; desconexión física no probada (acción del usuario pendiente).
+- P5 (verificación visual con curl en `http://127.0.0.1:8771`; capturas sueltas salvo `p5_1`/`p5_2`, separadas 10 s): `run_p2\frame_a.jpg` pantalla de título «PRESS START»; tras Enter ×10 (`/key?down=enter` con liberación), `run_p2\frame_c.jpg` diálogo «You do not have an active gamer profile… CONTINUE / SIGN IN»; tras izquierda + Z → `run_p2\frame_d.jpg`, **menú principal** («STORY MODE / ARENA MODES / OPTIONS»); `run_p2\p5_1.jpg` y `p5_2.jpg` (capturas separadas 10 s) muestran el menú principal sin «PORTAL DISCONNECTED». En ninguna captura apareció «PORTAL DISCONNECTED». No se hizo una ejecución de control con el código P1 que confirme causalidad: el cambio de retorno (0xC00000BB → 0) coincide con la desaparición del aviso, pero no está aislado [NV].
+- Navegación (`run_p3`): título → diálogo de perfil (repetible) → Story Mode → selección de dificultad (EASY/MEDIUM/HARD/NIGHTMARE; `s3.jpg`) → Z → pantalla negra (`s4.jpg`, `s5.jpg`) mientras el juego carga `archives\TA_VolcanoIntro_genbank_en.pak` (NtCreateFile del .pak en el log). Frames avanzando (2635); sin aviso del Portal. Si la pantalla negra es carga o bloqueo: [NV] (no se esperó más allá de ~2 min).
+
+**Hallazgo nuevo (no del Portal):** el diálogo de perfil de jugador aparece al pulsar START sin perfil activo (`XamUserGetSigninState` devuelve 0 en la línea base). La resolución de ese diálogo se hizo por entrada de teclado, no por cambio de código.
+
+**Siguiente bloqueo:** (1) escrituras OUT sin respuesta (100 ms timeout, ERR 121) desde la primera escritura del juego; el juego sigue avanzando, pero no está demostrado que el dispositivo reciba o procese los comandos [NV]; (2) pantalla negra tras seleccionar dificultad y durante la carga de `TA_VolcanoIntro` [NV]. Pendiente de usuario: P4 (desconexión/reconexión física) y ejecución de control sin Portal (GetRaw 0x48F).
+
 ## Rendimiento M8 (ejecutado 2026-10-22/23; propietario CPU/GPU/runtime del árbol principal)
 Objetivo: VdSwap ≥ 20/s sostenido ≥ 30 s con D3D12 (camino de render y resolve completo) en la escena de los vídeos de arranque, sin degradar la imagen.
 **Resultado: cumplido en `--headless`** (por instrucción del usuario no se abre ventana; ver «Ventana» abajo).
