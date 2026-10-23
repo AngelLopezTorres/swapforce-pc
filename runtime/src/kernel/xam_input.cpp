@@ -38,16 +38,23 @@ XInputApi& Api() {
 std::atomic<uint32_t> g_inputStateCalls{0};
 std::atomic<uint32_t> g_startInjectAfterCalls{0};
 std::atomic<uint32_t> g_startInjectDurationCalls{0};
+// El teclado solo cuenta si la ventana del proceso tiene el foco (evita leer teclas escritas en otras aplicaciones).
+bool OwnWindowFocused() {
+    HWND fg=GetForegroundWindow(); if (!fg) return false;
+    DWORD pid=0; GetWindowThreadProcessId(fg,&pid);
+    return pid==GetCurrentProcessId();
+}
 bool Key(int vk) { return (GetAsyncKeyState(vk)&0x8000)!=0; }
 State KeyboardState() {
     State s{};
+    if (!OwnWindowFocused()) return s;
     if (Key(VK_UP)) s.pad.buttons|=kDpadUp;
     if (Key(VK_DOWN)) s.pad.buttons|=kDpadDown;
     if (Key(VK_LEFT)) s.pad.buttons|=kDpadLeft;
     if (Key(VK_RIGHT)) s.pad.buttons|=kDpadRight;
     if (Key(VK_RETURN)) s.pad.buttons|=kStart;
-    if (Key('Z')) s.pad.buttons|=kA;
-    if (Key('X')) s.pad.buttons|=kB;
+    if (Key('Z')||Key(VK_SPACE)) s.pad.buttons|=kA;
+    if (Key('X')||Key(VK_BACK)) s.pad.buttons|=kB;
     if (Key(VK_ESCAPE)) s.pad.buttons|=kBack;
     return s;
 }
