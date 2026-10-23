@@ -32,7 +32,7 @@ constexpr uint16_t kStart = 0x0010, kBack = 0x0020, kA = 0x1000, kB = 0x2000, kX
 constexpr int64_t kKeyTimeoutMs = 500;     // sin latido en 500 ms -> botones a 0
 constexpr int64_t kDemandMs = 3000;        // sin peticiones en 3 s -> no se codifica
 constexpr size_t kMaxHeader = 4096;
-constexpr uint32_t kMaxClients = 2;
+constexpr uint32_t kMaxClients = 12;   // el navegador deja conexiones colgadas: margen amplio (solo loopback)
 constexpr size_t kMaxJpeg = 4u << 20;      // 4 MiB
 
 Options g_opt;
@@ -160,7 +160,14 @@ void ServeStream(SOCKET s) {
             std::unique_lock<std::mutex> l(g_mu);
             g_cv.wait_for(l, std::chrono::milliseconds(1000), [&] { return g_stop || g_jpegSeq != last; });
             if (g_stop) return;
-            if (g_jpegSeq == last) { g_lastDemand = NowMs(); continue; }
+            if (g_jpegSeq == last) {
+                g_lastDemand = NowMs();
+                // el cliente puede haberse ido sin que se envie nada: detectarlo para liberar el hueco
+                char probe; u_long avail = 0; (void)avail;
+                fd_set rf; FD_ZERO(&rf); FD_SET(s, &rf); timeval tv{0, 0};
+                if (select(0, &rf, nullptr, nullptr, &tv) > 0 && recv(s, &probe, 1, MSG_PEEK) <= 0) return;
+                continue;
+            }
             last = g_jpegSeq;
             copy = g_jpeg;
         }
