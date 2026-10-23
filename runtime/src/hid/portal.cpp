@@ -272,6 +272,8 @@ static void LogRawCall(const char* name, PPCContext& ctx, uint8_t* base) {
 namespace {
 
 PortalWriteMode g_writeModeSetting = PortalWriteMode::Auto;   // --portal-write
+bool g_coalesceS = true;   // --portal-queue=coalesce|fifo: descarta informes 'S' antiguos pendientes al llegar otro 'S'
+PortalXlate g_xlate = PortalXlate::StripHdr;                      // --portal-xlate (defecto provisional; ver PROGRESS.md)
 // Valor de Auto para VID_1430&PID_0150 (dispositivo de este equipo). Fijado tras medir (ver PROGRESS.md, Portal escrituras).
 constexpr PortalWriteMode kAutoDefault0150 = PortalWriteMode::ControlExact;
 
@@ -287,7 +289,7 @@ constexpr DWORD kPortalIoTimeoutMs = 100;          // timeout = 100 de Xenia (ha
 constexpr size_t kPortalReportCap = 64;
 constexpr size_t kPortalWriteCap = 16;
 
-struct PortalPacket { uint32_t len = 0; uint8_t data[kPortalReportSize]{}; };
+struct PortalPacket { uint8_t type = 0; uint32_t len = 0; uint8_t data[kPortalReportSize]{}; };
 
 bool IsDisconnectError(DWORD e) {
     return e == ERROR_DEVICE_NOT_CONNECTED || e == ERROR_GEN_FAILURE ||
@@ -343,6 +345,13 @@ private:
 
     void PushReport(const PortalPacket& p) {
         std::lock_guard<std::mutex> lock(queueMu_);
+        if (g_coalesceS && p.type == 0x53) {
+            // El Portal emite rafagas de informes de estado 'S'; el juego lee uno por llamada (~20/s) y las respuestas
+            // (R/A/Q) quedaban ~1-2 s detras en la cola. Se conserva solo el 'S' mas reciente; el resto de informes no se toca.
+            for (auto it = reports_.begin(); it != reports_.end();) {
+                if (it->type == 0x53) { it = reports_.erase(it); ++coalescedS_; } else ++it;
+            }
+        }
         if (reports_.size() >= kPortalReportCap) { reports_.pop_front(); ++droppedReports_; }
         reports_.push_back(p);
     }
@@ -529,10 +538,27 @@ private:
             if (n == 0) { ++idle; return; }
             PortalPacket p;
             p.len = n;
+            p.type = buf[0];
             std::memcpy(p.data, buf, n);
+            const bool translated = g_xlate == PortalXlate::StripHdr || g_xlate == PortalXlate::StripHdrLen || g_xlate == PortalXlate::StripHdr20;
+            if (translated) {
+                uint8_t t[kPortalReportSize]{};
+                t[0] = 0x0B; t[1] = 0x14;
+                uint32_t off = 2;
+                if (g_xlate == PortalXlate::StripHdrLen) { t[2] = 0x1E; off = 3; }
+                const uint32_t copyN = std::min<uint32_t>(n, kPortalReportSize - off);
+                std::memcpy(t + off, buf, copyN);
+                p.len = std::min<uint32_t>(n + off, kPortalReportSize);
+                if (g_xlate == PortalXlate::StripHdr20) { p.len = 20; std::memset(t + 20, 0, kPortalReportSize - 20); }   // 0x14 = 20 B totales [NV]
+                std::memcpy(p.data, t, kPortalReportSize);
+            }
             PushReport(p);
-            ImportLog::Get().Printf("PORTAL USB dir=IN ep=0x%02X len=%u data[%u]=%s res=OK", inPipe_, n, n,
-                                    HexOf(buf, n).c_str());
+            if (translated)
+                ImportLog::Get().Printf("PORTAL USB dir=IN ep=0x%02X len=%u data[%u]=%s res=OK xlate=hdr entregado[%u]=%s", inPipe_, n, n,
+                                        HexOf(buf, n).c_str(), p.len, HexOf(p.data, p.len).c_str());
+            else
+                ImportLog::Get().Printf("PORTAL USB dir=IN ep=0x%02X len=%u data[%u]=%s res=OK xlate=no", inPipe_, n, n,
+                                        HexOf(buf, n).c_str());
             return;
         }
         const DWORD err = GetLastError();
@@ -550,6 +576,7 @@ private:
     std::mutex queueMu_;
     std::deque<PortalPacket> reports_, writes_;
     uint64_t droppedReports_ = 0;
+    uint64_t coalescedS_ = 0;
 };
 
 } // namespace
@@ -579,6 +606,25 @@ static void LogRawOutcome(const char* name, uint64_t call, uint32_t ret, uint8_t
     ImportLog::Get().Printf("PORTAL %s OUT call=%llu ret=%08X len=%08X->%08X state=%04X->%04X buf[%u]=%s",
                             name, static_cast<unsigned long long>(call), ret, lenIn, lenOut,
                             stateIn, stateOut, n, hex);
+}
+
+bool SetPortalQueue(const char* text) {
+    if (!text) return false;
+    if (!std::strcmp(text, "coalesce")) g_coalesceS = true;
+    else if (!std::strcmp(text, "fifo")) g_coalesceS = false;
+    else return false;
+    return true;
+}
+
+bool SetPortalXlate(const char* text) {
+    if (!text) return false;
+    if (!std::strcmp(text, "none")) g_xlate = PortalXlate::None;
+    else if (!std::strcmp(text, "strip")) g_xlate = PortalXlate::Strip;
+    else if (!std::strcmp(text, "strip-hdr")) g_xlate = PortalXlate::StripHdr;
+    else if (!std::strcmp(text, "strip-hdrlen")) g_xlate = PortalXlate::StripHdrLen;
+    else if (!std::strcmp(text, "strip-hdr20")) g_xlate = PortalXlate::StripHdr20;
+    else return false;
+    return true;
 }
 
 bool SetPortalWriteMode(const char* text) {
@@ -624,6 +670,12 @@ void XamInputNonControllerGetRaw(PPCContext& ctx, uint8_t* base) {
             if (io.PopReport(r)) {
                 n = r.len < cap ? r.len : cap;
                 std::memcpy(base + bufPtr, r.data, n);
+                // Registro de lo que consume el juego (se omiten los informes de estado 'S' por volumen).
+                const bool hdr = g_xlate == PortalXlate::StripHdr || g_xlate == PortalXlate::StripHdrLen || g_xlate == PortalXlate::StripHdr20;
+                const uint8_t type = hdr ? r.data[(g_xlate == PortalXlate::StripHdrLen) ? 3 : 2] : r.data[0];
+                if (type != 0x53)
+                    ImportLog::Get().Printf("PORTAL XLATE dir=IN entregado_al_juego call=%llu cap=%u len=%u data[%u]=%s",
+                                            static_cast<unsigned long long>(call), cap, n, n, HexOf(r.data, n).c_str());
             }
             // Regla de Xenia: state = (estado anterior == estado actual), ambos OK.
             const uint16_t state = io.prevStatus == kPortalOk ? 1 : 0;
@@ -646,6 +698,27 @@ void XamInputNonControllerSetRaw(PPCContext& ctx, uint8_t* base) {
         ret = kPortalInvalidParameter;
     } else if (!io.connected) {
         ret = kPortalNotConnected;
+    } else if (g_xlate != PortalXlate::None) {
+        // Traduccion Xbox 360 -> Portal: quitar `0B 14`, rellenar a 32 B; solo ordenes de lectura/activacion.
+        const uint8_t* g = base + bufPtr;
+        const std::string gameHex = HexOf(g, len);
+        const char* action = nullptr;
+        uint8_t dev[kPortalReportSize]{};
+        if (len >= 3 && g[0] == 0x0B && g[1] == 0x14) {
+            const uint8_t cmd = g[2];
+            if (cmd == 'W') action = "descartada(escritura W: proteccion de la figura)";
+            else if (cmd == 'R' || cmd == 'A' || cmd == 'S' || cmd == 'Q' || cmd == 'C') {
+                std::memcpy(dev, g + 2, len - 2);
+                action = "traducida y reenviada";
+            } else action = "descartada(orden desconocida, no identificada como solo lectura)";
+        } else {
+            action = "descartada(sin cabecera 0B 14 o sin orden)";
+        }
+        const bool fwd = action[0] == 't';
+        ImportLog::Get().Printf("PORTAL XLATE dir=OUT call=%llu game_len=%u game=%s accion=%s%s%s", 
+                                static_cast<unsigned long long>(call), len, gameHex.c_str(), action,
+                                fwd ? " dev[32]=" : "", fwd ? HexOf(dev, kPortalReportSize).c_str() : "");
+        if (fwd && !io.PushWrite(dev, kPortalReportSize)) ret = kPortalBusy;
     } else if (!io.PushWrite(base + bufPtr, len)) {
         ret = kPortalBusy;   // cola llena (16): no se descarta ni reordena ningun paquete
     }

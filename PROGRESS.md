@@ -686,3 +686,69 @@ Nota: el proceso de la prueba `control` terminó tras 3313 fotogramas (`viewer: 
 **Compilación** (`runtime\vb_cpu.cmd`, `build_cpu`, 532 objetivos, clang-cl): OK. `--headless --selftest-load`: functable 123471 = PPCFuncMappings; `--selftest-cpu 2000 1`: total=2810790 fail=0 (690 funciones, 62 familias).
 **Juego** (`--headless --viewer 8775 --viewer-input --bink-trace --perf-nosample --log-time`, `runtime\run1`, ejecutado): tras EASY se abre `D:\archives\fmv01.bk2`; 0 `LLAMADA SIN RESOLVER`; 0 `debugtrap`; BINKPLANE con hashY distintos (212 hashes distintos en 415 líneas; distinct(Y)=501-551 hacia frame 1190-1290; al inicio 1,1,1 = plano uniforme). `RtlRaiseException 0x406D1388` en BinkAsy4 es la denominación de hilo del XDK (también en otros hilos), no fallo. El contador Bink llegó a frame 3936 sin detenerse. De 20 capturas `/frame.jpg` (cada 5 s) las 20 tienen hash distinto; abiertas f_9, f_14, f_20: se ve la cinemática renderizada (personajes de Skylanders sobre cielo tormentoso, sin artefactos evidentes; f_14 un destello azul/blanco). Capturas en `runtime\run1\f_*.jpg`.
 **Siguiente bloqueo:** ninguno de CPU observado. [NV] fin de la cinemática y paso a la siguiente escena no comprobados (la ejecución se interrumpió con la cinemática en curso); el log registra continuamente sondeos `PORTAL USB`. Audio de la cinemática (XMA/Bink audio) no evaluado.
+
+
+## Portal Xbox 360->PC (2026-10-23, worktree `_wt_portal3`, rama portal-xbox; propietario Audio/entrada)
+
+Autorizacion del usuario (23/10/2026): traducir formato Xbox 360 <-> PC (quitar `0B 14` en OUT, rellenar a 32 B; anadir cabecera en IN). Limites: solo se reenvian las ordenes que emite el juego; 'W' (0x57) nunca se reenvia (se registra y se descarta devolviendo exito); ordenes desconocidas se descartan; no se enviaron ordenes propias. Dispositivo: Spyro Porta 1430:0150, escritura `control` (SET_REPORT 21/09/0200/0000, 32 B).
+
+### CLI
+- `--portal-xlate=none|strip|strip-hdr|strip-hdr20|strip-hdrlen` (defecto `strip-hdr`).
+  - `none`: paso directo anterior. `strip`: OUT sin `0B 14` + relleno a 32 B; IN sin cambios. `strip-hdr`: `strip` + IN `0B 14` + informe (30 B utiles, 32 B entregados). `strip-hdr20`: IN `0B 14` + 18 B, longitud 20 [NV]. `strip-hdrlen`: IN `0B 14 1E` + 29 B [NV, byte 1E inventado como longitud de carga: es una hipotesis de formato].
+- `--portal-queue=coalesce|fifo` (defecto `coalesce`): al llegar un informe 'S' se descartan los 'S' antiguos pendientes; el resto (R, A, Q) no se toca.
+- OUT permitidos: R, A, S, Q, C. Registro: `PORTAL XLATE dir=OUT` (juego, accion, 32 B al dispositivo), `PORTAL USB dir=OUT via=control ... res=`, `PORTAL USB dir=IN ... xlate=`, `PORTAL XLATE dir=IN entregado_al_juego` (solo no-'S').
+
+### Medidas (ejecutadas, `--headless`, Portal real con figura puesta; logs en `runtimeuild_portal3uns\<variante>untime.log`)
+| Variante | Resultado |
+|---|---|
+| `none` (previo) | 326 x `0B 14 52 00` sin respuesta util; pantalla «PLEASE PLACE YOUR SKYLANDER» |
+| `strip` | El dispositivo responde a 'R' con `52 02 03 00..`; el juego repite solo `R` (601/601 en 190 s), sin A/S/Q |
+| `strip-hdr` (FIFO) | El juego avanza: R -> A `41 00` -> A `41 01` -> S -> Q `20 00` (x3) -> vuelve a R; 0 errores USB. Latencia medida de la respuesta Q hasta el juego ~1-2 s (cola con rafagas de 'S', el juego lee 1 informe por llamada, ~20/s) |
+| `strip-hdr20` | Igual que `strip-hdr` (llega a Q 20 00 x3 y reinicia) |
+| `strip-hdrlen` | Igual que `strip`: solo R (319 de 319) |
+| `strip-hdr` + `coalesce` | El juego lee las 54 consultas Q (bloques 0x00-0x3F salvo cabeceras de sector), todas con respuesta `51 10 BB <16 B>` entregada; despues repite A `41 01` + S cada ~10 s. Pantalla: «This toy can't be used with this game. Visit the Customer Care website at support.activision.com» (fondo gris, linea azul inferior) |
+
+Ejecucion final (`runsinal`, visor 8765, `--timeout 1800`): 2088 C, 54 Q, 16 A, 13 S, 2 R traducidas; 0 'W'; 0 descartes; 2173 OUT OK / 0 ERR; 8158 informes IN.
+
+### Diagnostico
+- Causa 1 (resuelta): la cabecera `0B 14` en OUT impedia que el Portal PC entendiera las ordenes; sin ella responde. 
+- Causa 2 (resuelta): el juego exige la cabecera `0B 14` en IN (sin ella no consume R).
+- Causa 3 (resuelta): la cola FIFO retrasaba las respuestas 1-2 s; con `coalesce` el juego completa la lectura de la figura.
+- Estado actual: el juego detecta la figura y lee todos los bloques, pero la rechaza. Causas posibles [NV]: (a) la figura es de un juego no compatible con Swap Force (bytes 0-1 del bloque 1 = `D2 01` = 466, sin tabla para contrastar); (b) diferencia entre la respuesta Q del Portal PC y la del Xbox 360 (el nibble alto del segundo byte de las peticiones Q del juego vale 1-4 y la respuesta del dispositivo siempre es `10`; su significado es [NV]); (c) el juego valida datos cifrados. No determinado.
+- Falta: formato real de los informes de entrada del Portal de Xbox 360; una segunda figura Swap Force conocida para descartar (a).
+
+### Compilacion
+`runtimeb_portal3.cmd` (copia de vb_view.cmd con `build_portal3`): exit 0, `build_portal3\out\SwapForceRT.exe`. Scripts de prueba `build_portal3
+av3.ps1`, `nav_final.ps1`, `an.py`. Tecla de salto de cinematica en el visor: `y` pulsada y soltada (el nivel mantenido no genera flanco).
+
+## Portal Xbox 360->PC (2026-10-23, worktree `_wt_portal3`, rama portal-xbox; propietario Audio/entrada)
+
+Autorizacion del usuario (23/10/2026): traducir formato Xbox 360 <-> PC (quitar `0B 14` en OUT, rellenar a 32 B; anadir cabecera en IN). Limites: solo se reenvian las ordenes que emite el juego; 'W' (0x57) nunca se reenvia (se registra y se descarta devolviendo exito); ordenes desconocidas se descartan; no se enviaron ordenes propias. Dispositivo: Spyro Porta 1430:0150, escritura `control` (SET_REPORT 21/09/0200/0000, 32 B).
+
+### CLI
+- `--portal-xlate=none|strip|strip-hdr|strip-hdr20|strip-hdrlen` (defecto `strip-hdr`).
+  - `none`: paso directo anterior. `strip`: OUT sin `0B 14` + relleno a 32 B; IN sin cambios. `strip-hdr`: `strip` + IN `0B 14` + informe (30 B utiles, 32 B entregados). `strip-hdr20`: IN `0B 14` + 18 B, longitud 20 [NV]. `strip-hdrlen`: IN `0B 14 1E` + 29 B (el byte 1E es una hipotesis de formato, no contrastada).
+- `--portal-queue=coalesce|fifo` (defecto `coalesce`): al llegar un informe 'S' se descartan los 'S' antiguos pendientes; el resto (R, A, Q) no se toca.
+- OUT permitidos: R, A, S, Q, C. Registro: `PORTAL XLATE dir=OUT` (juego, accion, 32 B al dispositivo), `PORTAL USB dir=OUT via=control ... res=`, `PORTAL USB dir=IN ... xlate=`, `PORTAL XLATE dir=IN entregado_al_juego` (solo informes no 'S').
+
+### Medidas (ejecutadas, `--headless`, Portal real con figura puesta; logs en `runtime/build_portal3/runs/<variante>/runtime.log`)
+| Variante | Resultado |
+|---|---|
+| `none` (previo) | 326 x `0B 14 52 00` sin respuesta util; pantalla "PLEASE PLACE YOUR SKYLANDER" |
+| `strip` | El dispositivo responde a 'R' con `52 02 03 00..`; el juego repite solo `R` (601 de 601 en 190 s), sin A/S/Q |
+| `strip-hdr` (FIFO) | El juego avanza: R, A `41 00`, A `41 01`, S, Q `20 00` (x3), vuelve a R; 0 errores USB. Latencia de la respuesta Q hasta el juego ~1-2 s (cola con rafagas de 'S'; el juego lee 1 informe por llamada, ~20/s) |
+| `strip-hdr20` | Igual que `strip-hdr` (llega a Q `20 00` x3 y reinicia) |
+| `strip-hdrlen` | Igual que `strip`: solo R (319 de 319) |
+| `strip-hdr` + `coalesce` | El juego lee 54 consultas Q (bloques 0x00-0x3F salvo cabeceras de sector), todas con respuesta `51 10 BB <16 B>` entregada; despues repite A `41 01` + S cada ~10 s. Pantalla: "This toy can't be used with this game. Visit the Customer Care website at support.activision.com" (fondo gris, linea azul inferior) |
+
+Ejecucion final (`runs/final`, visor 8765, `--timeout 1800`): 2088 C, 54 Q, 16 A, 13 S, 2 R traducidas; 0 'W'; 0 descartes; 2173 OUT OK, 0 ERR; 8158 informes IN.
+
+### Diagnostico
+- Resuelto: la cabecera `0B 14` en OUT impedia que el Portal PC entendiera las ordenes (sin ella responde).
+- Resuelto: el juego exige la cabecera `0B 14` en IN (sin ella no consume la respuesta a R).
+- Resuelto: la cola FIFO retrasaba las respuestas 1-2 s; con `coalesce` el juego completa la lectura de la figura.
+- Estado actual: el juego detecta la figura y lee todos los bloques, pero la rechaza. Causas posibles [NV]: (a) figura de un juego no compatible con Swap Force (bytes 0-1 del bloque 1 = `D2 01` = 466, sin tabla para contrastar); (b) diferencia entre la respuesta Q del Portal PC y la del Xbox 360 (el nibble alto del 2.o byte de las peticiones Q del juego vale 1-4 y la respuesta del dispositivo siempre es `10`; significado [NV]); (c) validacion de datos cifrados. No determinado.
+- Falta: formato real de los informes de entrada del Portal de Xbox 360; una segunda figura Swap Force conocida para descartar (a).
+
+### Compilacion y scripts
+`runtime/vb_portal3.cmd` (copia de vb_view.cmd con `build_portal3`): exit 0, `build_portal3/out/SwapForceRT.exe`. Scripts: `build_portal3/nav3.ps1`, `nav_final.ps1`, `an.py`. En el visor, la tecla `y` debe pulsarse y soltarse para saltar cinematicas (mantenida no genera flanco).
