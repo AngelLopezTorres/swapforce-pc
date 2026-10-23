@@ -252,6 +252,13 @@ ID3D12PipelineState* D3D12Backend::GetPso(const ShaderInfo& vsI, const ShaderInf
         d.DepthStencilState.DepthEnable = TRUE;
         d.DepthStencilState.DepthWriteMask = depth.z_write_enable ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
         d.DepthStencilState.DepthFunc = (D3D12_COMPARISON_FUNC)((uint32_t)D3D12_COMPARISON_FUNC_NEVER + (uint32_t)depth.zfunc);
+        // En esta ruta de viewport/EDRAM, invertir la comparacion Z reproduce
+        // la profundidad del titulo; la causa general aun no esta verificada.
+        auto& f = d.DepthStencilState.DepthFunc;
+        if (f == D3D12_COMPARISON_FUNC_GREATER_EQUAL) f = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+        else if (f == D3D12_COMPARISON_FUNC_GREATER) f = D3D12_COMPARISON_FUNC_LESS;
+        else if (f == D3D12_COMPARISON_FUNC_LESS_EQUAL) f = D3D12_COMPARISON_FUNC_GREATER_EQUAL;
+        else if (f == D3D12_COMPARISON_FUNC_LESS) f = D3D12_COMPARISON_FUNC_GREATER;
     }
     if (stencilOn) {
         d.DepthStencilState.StencilEnable = TRUE;

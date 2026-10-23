@@ -323,7 +323,82 @@ bool D3D12Backend::DoResolve(const DrawEvent& ev) {
             }
         }
     } else {
-        Note("SIMPLIFY resolve de profundidad no implementado: destino sin escribir");
+        auto di = R<reg::RB_DEPTH_INFO>();
+        srcBase = di.depth_base | (di.depth_base_bit_11 << 11);
+        src = GetDepthRT(srcBase, surf.surface_pitch, (uint32_t)di.depth_format, needH);
+        if (src && (uint32_t)di.depth_format == 1 &&
+            ((uint32_t)dinfo.copy_dest_format == 6 || (uint32_t)dinfo.copy_dest_format == 23)) {
+            // D32_FLOAT_S8X24: plano 0, subrecurso completo. D3D12 no permite copiar
+            // una subregion de un recurso de profundidad (CopyTextureRegion).
+            D3D12_RESOURCE_DESC desc = src->res->GetDesc();
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
+            UINT rows = 0;
+            UINT64 rowBytes = 0, totalBytes = 0;
+            dev->GetCopyableFootprints(&desc, 0, 1, 0, &fp, &rows, &rowBytes, &totalBytes);
+            if ((fp.Footprint.Format == DXGI_FORMAT_R32_TYPELESS || fp.Footprint.Format == DXGI_FORMAT_R32_FLOAT) &&
+                totalBytes && totalBytes <= (64ull << 20)) {
+                D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_READBACK};
+                D3D12_RESOURCE_DESC bd = {};
+                bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = totalBytes;
+                bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+                bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                bool ready = true;
+                if (!depthReadback || depthReadbackBytes < totalBytes) {
+                    depthReadback.Reset();
+                    depthReadbackBytes = totalBytes;
+                    ready = Hr(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                            nullptr, IID_PPV_ARGS(&depthReadback)), "CreateCommittedResource(resolve profundidad)");
+                }
+                if (ready) {
+                    Transition(src->res.Get(), src->state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    src->state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                    D3D12_TEXTURE_COPY_LOCATION from = {}, to = {};
+                    from.pResource = src->res.Get(); from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; from.SubresourceIndex = 0;
+                    to.pResource = depthReadback.Get(); to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; to.PlacedFootprint = fp;
+                    cl->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+                    FlushAndWait();
+                    void* mapped = nullptr;
+                    D3D12_RANGE readRange = {0, (SIZE_T)totalBytes};
+                    if (Hr(depthReadback->Map(0, &readRange, &mapped), "Map(resolve profundidad)")) {
+                        PendingResolve pr;
+                        pr.frame = FrameCount() + 1; pr.bpp = 4; pr.bppLog2 = 2;
+                        pr.rowPitch = (w * 4 + 255) & ~255u;
+                        pr.w = w; pr.h = h; pr.x0 = x0; pr.y0 = y0;
+                        pr.destBase = destBase; pr.endian = (uint32_t)dinfo.copy_dest_endian;
+                        pr.dfmt = (uint32_t)dinfo.copy_dest_format;
+                        pr.dpAligned = (dpitch.copy_dest_pitch + 31) & ~31u;
+                        if (!pr.dpAligned) pr.dpAligned = (surf.surface_pitch + 31) & ~31u;
+                        uint32_t ax0 = (uint32_t)x0 & ~31u, ay0 = (uint32_t)y0 & ~31u;
+                        uint32_t ax1 = ((uint32_t)x1 + 31) & ~31u, ay1 = ((uint32_t)y1 + 31) & ~31u;
+                        pr.lo = (int64_t)destBase + xe::gpu::texture_address::Tiled2D((int32_t)ax0, (int32_t)ay0, pr.dpAligned, 2);
+                        pr.hi = (int64_t)destBase + xe::gpu::texture_address::Tiled2D((int32_t)ax1 - 32, (int32_t)ay1 - 32, pr.dpAligned, 2) + 4096;
+                        if (pr.lo >= 0 && pr.hi > pr.lo && pr.hi <= 0x20000000)
+                            pr.mem = PhysHost((uint32_t)pr.lo, (uint32_t)(pr.hi - pr.lo));
+                        if (pr.mem) {
+                            FlushResolvesIfOverlap((uint32_t)pr.lo, (uint32_t)pr.hi);
+                            InvalidateTexMemo((uint32_t)pr.lo, (uint32_t)pr.hi);
+                            InvalidateResolvedTex((uint32_t)pr.lo, (uint32_t)pr.hi);
+                            depthResolveScratch.resize((size_t)pr.rowPitch * h);
+                            for (uint32_t y = 0; y < h; ++y) {
+                                const uint8_t* row = (const uint8_t*)mapped + (size_t)(y0 + y) * fp.Footprint.RowPitch + (size_t)x0 * 4;
+                                uint32_t* out = (uint32_t*)(depthResolveScratch.data() + (size_t)y * pr.rowPitch);
+                                for (uint32_t x = 0; x < w; ++x) {
+                                    float depth; std::memcpy(&depth, row + x * 4, 4);
+                                    out[x] = xenos::Float32To20e4(depth * 2.0f, true) << 8;
+                                }
+                            }
+                            WriteResolve(pr, depthResolveScratch.data());
+                            wrote = true;
+                            static uint64_t depthWrites = 0;
+                            if (++depthWrites <= 4 || depthWrites % 500 == 0)
+                                ImportLog::Get().Printf("D3D12 DEPTH_RESOLVE dst=%08X %ux%u writes=%llu", destBase, w, h,
+                                    (unsigned long long)depthWrites);
+                        }
+                        D3D12_RANGE wr = {0, 0}; depthReadback->Unmap(0, &wr);
+                    }
+                }
+            } else Note("SIMPLIFY resolve de profundidad: formato de plano no soportado=" + std::to_string((uint32_t)fp.Footprint.Format));
+        } else Note("SIMPLIFY resolve de profundidad no implementado para este formato");
     }
     // ---- limpiezas del resolve (RB_COPY_CONTROL.color_clear_enable / depth_clear_enable) sobre la region ----
     D3D12_RECT rect = {x0, y0, x1, y1};

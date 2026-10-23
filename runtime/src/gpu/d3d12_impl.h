@@ -125,6 +125,9 @@ public:
     ComPtr<ID3D12Resource> readback;           // fotograma completo (volcado/estadisticas)
     ComPtr<ID3D12Resource> resolveReadback;    // resolve (region de un RT)
     uint64_t resolveReadbackBytes = 0;
+    ComPtr<ID3D12Resource> depthReadback;      // plano de profundidad completo (copia D3D12)
+    uint64_t depthReadbackBytes = 0;
+    std::vector<uint8_t> depthResolveScratch;
     std::set<uint32_t> dumpSet;
     std::string adapterName;
     bool usingWarp = false;
