@@ -10,14 +10,15 @@ Incluye únicamente: código propio del runtime (`runtime/src`), scripts de aná
 
 **Se requiere la ISO del propio usuario** (copia legítima del juego). Todo lo derivado del juego se genera en local con `setup.ps1` y está excluido por `.gitignore`.
 
-## Estado real (2026-10-11)
+## Estado real (2026-10-23)
 
-- **No jugable.** El juego arranca, inicializa vídeo, carga y sube shaders, y ejecuta su bucle principal; no hay audio, ni entrada (H6 no iniciado), ni portal USB.
-- La imagen presentada es **negra**: la composición final usa los planos Y/U/V de un vídeo **Bink 2** que permanecen constantes (Y=0x10, U=V=0x80); no se ha decodificado Bink ni se ha investigado por qué el vídeo no avanza.
-- Rendimiento medido: **7–9 fotogramas/s** (sincronización por *resolve* y destilado del frontbuffer por CPU).
-- Traductor de shaders: 55/55 shaders observados compilan a DXIL; solo los de limpieza se han contrastado numéricamente. Simplificaciones de EDRAM, MSAA y profundidad registradas en `PROGRESS.md`.
+- **No jugable.** El juego arranca, ejecuta su bucle principal y presenta imagen, pero solo se ven los vídeos de arranque (animación metálica inicial, logotipo de Activision y vídeo de Vicarious Visions, Bink 1 y Bink 2). Después, la imagen queda en **blanco uniforme** (hash fijo) y el juego no carga más contenido. Causa en investigación: la pasada final dibuja con coordenadas UV planas en el píxel (`PROGRESS.md`, apartado Codex ronda 5) [NV].
+- Rendimiento medido (`--headless`, GPU RTX 4070 SUPER): ~28 VdSwap/s de media en los vídeos (tope del juego: 30). No medido con ventana.
+- Sin sonido (sumidero nulo, XMA solo contextos), sin entrada efectiva en el juego (XInput/teclado y visor implementados; el juego aún no la pide), Portal USB solo con autotest de lectura.
+- Traductor de shaders: todos los shaders observados compilan a DXIL; solo los de limpieza se han contrastado numéricamente. Simplificaciones de EDRAM, MSAA y profundidad registradas en `PROGRESS.md`.
 - Verificado únicamente en: Windows 11 Pro 10.0.26200, NVIDIA GeForce RTX 4070 SUPER (también WARP). Otros equipos: [NV].
-- Detalle, cifras y puntos no verificados [NV]: `PROGRESS.md`, `PLAN_RUNTIME.md`, `PLAN_VIDEO.md`, `PLAN_GPU.md`.
+- Comprobado con un clon limpio de este repositorio: `setup.ps1` termina con código 0 (≈4 min con la extracción ya hecha y 6 trabajos de compilación) y los autotests `--selftest-load/cpu/input/xma/portal` pasan.
+- Detalle, cifras y puntos no verificados [NV]: `PROGRESS.md` y `PLAN_*.md`.
 
 ## Requisitos
 
@@ -38,8 +39,11 @@ Incluye únicamente: código propio del runtime (`runtime/src`), scripts de aná
 ```
 powershell -NoProfile -ExecutionPolicy Bypass -File setup.ps1 -IsoPath "D:\ruta\a\mi_copia.iso"
 ```
-`setup.ps1` ejecuta, en este orden: descarga de `extract-xiso` (SHA-256 fijado) → extracción de la ISO a `iso_extract\` → descifrado/descompresión de `default.xex` a `analysis\image.bin` → clonado de `hedge-dev/XenonRecomp` en el commit `ddd128b…` + `patches/XenonRecomp-swapforce.patch` + compilación → XenonAnalyse → `iterate_extents.py` → `find_missing_switch.py` → `prune_loop.py` (XenonRecomp → `runtime\ppc_gen`) → descarga de DXC v1.8.2407 (SHA-256 fijado) → compilación (`runtime\build\SwapForceRT.exe`, ≈ 125 s con 18 trabajos en el equipo de desarrollo).
-Ejecución (desde `runtime\`): `build\SwapForceRT.exe` (opciones en `PROGRESS.md`, sección GPU).
+`setup.ps1` ejecuta, en este orden: descarga de `extract-xiso` (SHA-256 fijado) → extracción de la ISO a `iso_extract\` → descifrado/descompresión de `default.xex` a `analysis\image.bin` → clonado de `hedge-dev/XenonRecomp` en el commit `ddd128b…` + `patches/XenonRecomp-swapforce.patch` + compilación → XenonAnalyse → `iterate_extents.py` → `find_missing_switch.py` → `prune_loop.py` (XenonRecomp → `runtime\ppc_gen`) → descarga de DXC v1.8.2407 (SHA-256 fijado) → compilación (`runtime\build\SwapForceRT.exe`, ≈ 125 s con 18 trabajos en el equipo de desarrollo; ≈ 4 min en total con 6 trabajos).
+Opciones útiles de `setup.ps1`: `-SkipExtract` (reutiliza `iso_extract\` ya presente en la raíz del repositorio; no admite otra ruta) y `-SkipBuild`. La compilación usa los trabajos que fije la variable `CMAKE_BUILD_PARALLEL_LEVEL`. Tras `setup.ps1`, `runtime/recomp/extents.txt` puede aparecer como modificado (solo finales de línea).
+Ejecución (desde `runtime\`): `build\SwapForceRT.exe --headless --timeout 120 --log <ruta>\runtime.log --gpu-log <ruta>\gpu.log --frames-dir <ruta>\frames --dump-frames 150,300,420 > salida.txt` (opciones completas en `PROGRESS.md`). `--headless` no abre ventana; sin él se abre una ventana de 1280x720.
+Visor en el navegador (sin ventana): añadir `--viewer 8765` (y `--viewer-input` para teclas) y abrir `http://127.0.0.1:8765/`; solo escucha en 127.0.0.1.
+Los shaders usados por `--shader-test` se generan al ejecutar el juego en `runtime\userdata\shaders\`.
 Los resultados intermedios deterministas se resumen en `setup_hashes.txt` (SHA-256 de `runtime\ppc_gen`).
 
 ## Licencias
