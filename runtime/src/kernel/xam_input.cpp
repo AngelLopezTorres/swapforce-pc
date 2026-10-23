@@ -55,7 +55,7 @@ State KeyboardState() {
     if (Key(VK_RETURN)) s.pad.buttons|=kStart;
     if (Key('Z')||Key(VK_SPACE)) s.pad.buttons|=kA;
     if (Key('X')||Key(VK_BACK)) s.pad.buttons|=kB;
-    if (Key('C')) s.pad.buttons|=kYb;   // Y (p. ej. SKIP de las cinematicas)
+    if (Key('C')||Key('Y')) s.pad.buttons|=kYb;   // Y (p. ej. SKIP de las cinematicas)
     if (Key('V')) s.pad.buttons|=kXb;
     if (Key(VK_ESCAPE)) s.pad.buttons|=kBack;
     return s;
