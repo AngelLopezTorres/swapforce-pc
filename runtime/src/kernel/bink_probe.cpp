@@ -15,10 +15,14 @@
 #include "ppc_context.h"
 
 extern "C" PPC_FUNC(__imp__sub_82FC13C8);
+extern "C" PPC_FUNC(__imp__sub_830846E0);
+extern "C" PPC_FUNC(__imp__sub_83083C50);
+extern "C" PPC_FUNC(__imp__sub_83081258);
 
 namespace rt { bool g_binkProbeOn = false; }
 namespace {
 std::atomic<uint64_t> g_n82FC13C8{0};
+std::atomic<uint64_t> g_asyncWait{0}, g_asyncReady{0}, g_decode{0}, g_next{0};
 
 struct ProbeSlot {
     std::atomic<uint64_t> n{0};
@@ -67,6 +71,34 @@ ProbeSlot* Slots() {
 
 PPC_FUNC(sub_82FC13C8) { ++g_n82FC13C8; __imp__sub_82FC13C8(ctx, base); }
 
+// R9: comprueba si la cola asincrona entrega el primer fotograma de FMV01.
+PPC_FUNC(sub_830846E0) {
+    const uint32_t obj = ctx.r3.u32;
+    const uint32_t timeout = ctx.r4.u32;
+    __imp__sub_830846E0(ctx, base);
+    if (!rt::g_binkProbeOn) return;
+    const uint64_t n = ++g_asyncWait;
+    if (ctx.r3.u32) ++g_asyncReady;
+    if (obj && (n <= 8 || n % 100 == 0)) {
+        auto g = [&](uint32_t off) { return __builtin_bswap32(*reinterpret_cast<uint32_t*>(base + obj + off)); };
+        rt::ImportLog::Get().Printf("BINKASYNC n=%llu obj=%08X timeout=%u ret=%u flag272=%08X flag276=%08X frame=%u",
+            (unsigned long long)n, obj, timeout, ctx.r3.u32, g(272), g(276), g(1120));
+    }
+}
+PPC_FUNC(sub_83083C50) {
+    const uint32_t obj = ctx.r3.u32;
+    __imp__sub_83083C50(ctx, base);
+    if (!rt::g_binkProbeOn) return;
+    const uint64_t n = ++g_decode;
+    if (obj && (n <= 8 || n % 100 == 0))
+        rt::ImportLog::Get().Printf("BINKDECODE n=%llu obj=%08X ret=%u frame=%u", (unsigned long long)n,
+            obj, ctx.r3.u32, __builtin_bswap32(*reinterpret_cast<uint32_t*>(base + obj + 1120)));
+}
+PPC_FUNC(sub_83081258) {
+    __imp__sub_83081258(ctx, base);
+    if (rt::g_binkProbeOn) ++g_next;
+}
+
 // sub_830804C8: llamada por el bucle de reproduccion del juego (sub_825A80E0) antes de decodificar; si devuelve
 // distinto de 0 el juego no avanza el fotograma (estructura de BinkWait [NV]). Se registran los campos del objeto
 // (r3) que la funcion lee (desplazamientos decimales tomados del propio codigo) y el valor devuelto.
@@ -102,6 +134,8 @@ void BinkProbeReport() {
     log.Printf("BINKPROBE entradas sub_83088A88=%llu sub_82FC13C8=%llu funciones_BINK=%d llamadas_alguna_vez=%llu",
                (unsigned long long)BinkProbeCount(0x83088A88), (unsigned long long)g_n82FC13C8.load(), BINK_PROBE_N,
                (unsigned long long)called);
+    log.Printf("BINKASYNC total=%llu ready=%llu decode=%llu next=%llu", (unsigned long long)g_asyncWait.load(),
+               (unsigned long long)g_asyncReady.load(), (unsigned long long)g_decode.load(), (unsigned long long)g_next.load());
     for (int i = 0; i < BINK_PROBE_N; ++i) {
         ProbeSlot& s = Slots()[i];
         uint64_t n = s.n.load();
