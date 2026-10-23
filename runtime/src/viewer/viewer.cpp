@@ -193,11 +193,11 @@ void HandleClient(SOCKET s) {
             "<title>SwapForce visor</title><body style='margin:0;background:#000;display:flex;justify-content:center'>"
             "<img id=v src='/stream' style='max-width:100%;height:auto'>"
             "<script>"
-            "const K={ArrowUp:'up',ArrowDown:'down',ArrowLeft:'left',ArrowRight:'right',Enter:'enter',Escape:'esc',z:'esc',Z:'z',x:'x',X:'x'};"
+            "const K={ArrowUp:'up',ArrowDown:'down',ArrowLeft:'left',ArrowRight:'right',Enter:'enter',Escape:'esc',KeyZ:'z',Space:'z',KeyX:'x'};"
             "const act=new Set();"
             "function send(){const q=[...act].join(',');fetch('/key?down='+q,{method:'GET',cache:'no-store'}).catch(()=>{});}"
-            "addEventListener('keydown',e=>{const k=K[e.key];if(k){act.add(k);send();e.preventDefault();}});"
-            "addEventListener('keyup',e=>{const k=K[e.key];if(k){act.delete(k);send();}});"
+            "addEventListener('keydown',e=>{const k=K[e.code];if(k){act.add(k);send();e.preventDefault();}});"
+            "addEventListener('keyup',e=>{const k=K[e.code];if(k){act.delete(k);send();}});"
             "setInterval(send,200);"
             "</script></body></html>";
         char b[256];
