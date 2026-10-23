@@ -71,3 +71,8 @@ runtime/build/
 *.pre_*
 *.rej
 _e2e_test/
+runtime/vb_verify.cmd
+runtime/vb_rebuild.cmd
+runtime/build_codex_*/
+runtime/build_verify/
+m8_stall_stacks.txt
