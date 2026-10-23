@@ -45,6 +45,10 @@ bool SetPortalXlate(const char* text);   // "none" | "strip" | "strip-hdr" | "st
 // Cola de informes IN: "coalesce" (defecto) conserva solo el 'S' mas reciente; "fifo" conserva todos (64 max).
 bool SetPortalQueue(const char* text);
 
+// Normalizacion opcional de informes de estado del Portal.
+// Stable elimina el bit "cambiado" cuando el informe conserva presencia y posición.
+bool SetPortalState(const char* text);   // "raw" | "stable"
+
 bool ProbePortal(PortalProbeResult& result);
 bool PortalProbeAccepted(const PortalProbeResult& result);
 
