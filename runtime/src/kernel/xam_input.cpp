@@ -13,7 +13,7 @@ namespace rt { void ConfigureInputStartInjection(uint32_t afterCalls, uint32_t d
 namespace {
 constexpr uint32_t kDeviceNotConnected = 0x48F;
 constexpr uint16_t kDpadUp=0x0001, kDpadDown=0x0002, kDpadLeft=0x0004, kDpadRight=0x0008;
-constexpr uint16_t kStart=0x0010, kBack=0x0020, kA=0x1000, kB=0x2000;
+constexpr uint16_t kStart=0x0010, kBack=0x0020, kA=0x1000, kB=0x2000, kXb=0x4000, kYb=0x8000;
 struct Gamepad { uint16_t buttons; uint8_t lt, rt; int16_t lx, ly, rx, ry; };
 struct State { uint32_t packet; Gamepad pad; };
 struct Vibration { uint16_t left, right; };
@@ -55,6 +55,8 @@ State KeyboardState() {
     if (Key(VK_RETURN)) s.pad.buttons|=kStart;
     if (Key('Z')||Key(VK_SPACE)) s.pad.buttons|=kA;
     if (Key('X')||Key(VK_BACK)) s.pad.buttons|=kB;
+    if (Key('C')) s.pad.buttons|=kYb;   // Y (p. ej. SKIP de las cinematicas)
+    if (Key('V')) s.pad.buttons|=kXb;
     if (Key(VK_ESCAPE)) s.pad.buttons|=kBack;
     return s;
 }
