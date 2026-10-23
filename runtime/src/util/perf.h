@@ -26,6 +26,7 @@ enum Zone : int {
 
 extern bool g_enabled;
 extern bool g_sample;
+extern uint32_t g_tironMs;   // M60
 
 void Start(const char* outPath);   // inicia el muestreador (si no se llama, todo queda inactivo)
 void Stop();                       // detiene y escribe el informe

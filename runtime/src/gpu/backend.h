@@ -22,6 +22,8 @@ public:
     virtual void Shutdown() = 0;
     virtual void MemWritten(uint32_t /*phys*/, uint32_t /*bytes*/) {}   // M8
     virtual void SyncPoint() {}                                         // M8   // libera recursos y escribe el resumen en runtime.log
+    virtual bool WriteOrdered(uint32_t /*phys*/, const void* /*data*/, uint32_t /*bytes*/) { return false; }   // M60
+    virtual void ReadBarrier(uint32_t /*phys*/, uint32_t /*bytes*/) {}                                       // M60
 };
 
 Backend* Get();

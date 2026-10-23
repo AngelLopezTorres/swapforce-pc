@@ -1,4 +1,5 @@
 #include "perf.h"
+#include <algorithm>
 #include "fast_hash.h"
 #include <condition_variable>
 #include <mutex>
@@ -8,6 +9,7 @@
 #include "config.h"
 #include "fb_decode.h"
 #include "image_io.h"
+#include "gpu_names.h"
 #include "viewer/viewer.h"
 
 #pragma comment(lib, "d3d12.lib")
@@ -76,6 +78,12 @@ void D3D12Backend::Note(const std::string& key) {
     ++notes[key];
     if (notesLogged.insert(key).second) ImportLog::Get().Printf("D3D12 %s", key.c_str());
 }
+void D3D12Backend::Note(const char* lit) {
+    auto it = notesLit.find(lit);
+    if (it != notesLit.end()) { ++it->second; return; }
+    notesLit.emplace(lit, 1);
+    if (notesLogged.insert(lit).second) ImportLog::Get().Printf("D3D12 %s", lit);
+}
 
 bool D3D12Backend::Init() {
     if (!Hr(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)), "CreateDXGIFactory2")) return false;
@@ -132,7 +140,7 @@ bool D3D12Backend::Init() {
     D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_DEFAULT};
     D3D12_RESOURCE_DESC rd = {};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = kW; rd.Height = kH; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
-    rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; rd.SampleDesc.Count = 1; rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; rd.SampleDesc.Count = 1; rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;   // M60: UAV (presentacion por CS)
     D3D12_CLEAR_VALUE cv = {DXGI_FORMAT_R8G8B8A8_UNORM, {0, 0, 0, 1}};
     if (!Hr(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_RENDER_TARGET, &cv, IID_PPV_ARGS(&frameRT)), "frameRT")) return false;
     frameRtvIdx = rtvUsed++;
@@ -196,13 +204,201 @@ bool D3D12Backend::Init() {
 void D3D12Backend::WaitFence(uint64_t v) {
     if (fence->GetCompletedValue() >= v) return;
     PERF_ZONE(kZoneFenceWait);
+    rt::gpu::M60Event('W');
     fence->SetEventOnCompletion(v, fenceEvent);
     WaitForSingleObject(fenceEvent, 20000);
+    rt::gpu::M60Event('w');
 }
+// ---- M60: --gpu-timing ----
+// Marcas de tiempo de la cola (EndQuery TIMESTAMP) al abrir cada lista, tras cada operacion marcada (TsMark) y al cerrarla.
+// El tiempo entre dos marcas consecutivas de la misma lista se atribuye a la operacion de la segunda marca. Solo diagnostico.
+bool g_gpuTiming = false;
+static const char* kTsCatName[] = {"inicio", "draw", "resolve_color", "resolve_prof", "subida_mem", "subida_tex", "swap", "fin", "otro"};
+void D3D12Backend::TsBegin() {
+    if (!g_gpuTiming) return;
+    if (!tsHeap) {
+        D3D12_QUERY_HEAP_DESC qd = {D3D12_QUERY_HEAP_TYPE_TIMESTAMP, kTsSlots, 0};
+        if (!Hr(dev->CreateQueryHeap(&qd, IID_PPV_ARGS(&tsHeap)), "CreateQueryHeap(timestamp)")) { g_gpuTiming = false; return; }
+        D3D12_HEAP_PROPERTIES rp = {D3D12_HEAP_TYPE_READBACK};
+        D3D12_RESOURCE_DESC bd = {};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = (UINT64)kTsSlots * 8; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (!Hr(dev->CreateCommittedResource(&rp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&tsReadback)), "readback timestamp")) { g_gpuTiming = false; return; }
+        void* p = nullptr; D3D12_RANGE rr = {0, (SIZE_T)kTsSlots * 8};
+        tsReadback->Map(0, &rr, &p); tsCpu = (const uint64_t*)p;
+        queue->GetTimestampFrequency(&tsFreq);
+        tsFence.assign(kTsSlots, ~0ull); tsCat.assign(kTsSlots, 0); tsTag.assign(kTsSlots, 0);
+        QueryPerformanceCounter(&tsPrint);
+    }
+    if (tsNext - tsHarvest + 2 >= kTsSlots) return;   // sin hueco: esta lista no se mide
+    tsListFirst = tsNext;
+    tsOpen = true;
+    TsMark(0, 0);
+}
+void D3D12Backend::TsMark(uint8_t cat, uint64_t tag) {
+    if (!tsOpen) return;
+    if (tsNext - tsHarvest + 2 >= kTsSlots) return;
+    uint32_t i = (uint32_t)(tsNext % kTsSlots);
+    cl->EndQuery(tsHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, i);
+    tsCat[i] = cat; tsTag[i] = tag; tsFence[i] = ~0ull;
+    ++tsNext;
+}
+void D3D12Backend::TsEnd() {
+    if (!g_gpuTiming || !tsOpen) return;
+    TsMark(7, 0);
+    uint64_t q = tsListFirst;
+    while (q < tsNext) {   // resolucion en tramos contiguos del anillo
+        uint32_t i = (uint32_t)(q % kTsSlots);
+        uint32_t n = (uint32_t)std::min<uint64_t>(tsNext - q, kTsSlots - i);
+        cl->ResolveQueryData(tsHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, i, n, tsReadback.Get(), (UINT64)i * 8);
+        q += n;
+    }
+}
+void D3D12Backend::TsHarvest() {
+    if (!g_gpuTiming || !tsCpu) return;
+    uint64_t done = fence->GetCompletedValue();
+    while (tsHarvest < tsNext) {
+        uint32_t i = (uint32_t)(tsHarvest % kTsSlots);
+        if (tsFence[i] == ~0ull || tsFence[i] > done) break;
+        if (tsCat[i] != 0) {
+            uint32_t j = (uint32_t)((tsHarvest - 1) % kTsSlots);
+            uint64_t s = tsCpu[j], e = tsCpu[i];
+            if (e >= s) {
+                double d = (double)(e - s);
+                tsCatTicks[tsCat[i] < 9 ? tsCat[i] : 8] += d;
+                tsBusyTicks += d;
+                if (tsCat[i] == 1) tsTagTicks[tsTag[i]] += d;
+            }
+            if (tsCat[i] == 7) ++tsLists;
+        }
+        ++tsHarvest;
+    }
+    LARGE_INTEGER now, f; QueryPerformanceCounter(&now); QueryPerformanceFrequency(&f);
+    double el = (double)(now.QuadPart - tsPrint.QuadPart) / (double)f.QuadPart;
+    if (el >= 1.0) {
+        const double k = 1000.0 / (double)tsFreq;
+        char b[600]; int n = std::snprintf(b, sizeof(b), "M60 GPU ocupada_ms=%.1f en %.2f s listas=%llu lectura_MB=%.1f FlushAndWait=%llu |", tsBusyTicks * k, el, (unsigned long long)tsLists, tsReadbackBytes / 1048576.0, (unsigned long long)tsFlushWaits);
+        tsReadbackBytes = 0; tsFlushWaits = 0;
+        for (int c = 1; c < 9; ++c) if (tsCatTicks[c] > 0 && n < (int)sizeof(b) - 40) n += std::snprintf(b + n, sizeof(b) - n, " %s=%.1f", kTsCatName[c], tsCatTicks[c] * k);
+        ImportLog::Get().Printf("%s", b);
+        std::vector<std::pair<double, uint64_t>> top;
+        for (auto& kv : tsTagTicks) top.push_back({kv.second, kv.first});
+        std::sort(top.begin(), top.end(), [](auto& x, auto& y) { return x.first > y.first; });
+        for (size_t t = 0; t < top.size() && t < 6; ++t)
+            ImportLog::Get().Printf("M60 GPU draw ps/vs=%016llX ms=%.2f", (unsigned long long)top[t].second, top[t].first * k);
+        {
+            std::vector<std::pair<uint64_t, uint64_t>> rb;
+            for (auto& kv : tsResolveBytes) rb.push_back({kv.second.first, kv.first});
+            std::sort(rb.begin(), rb.end(), [](auto& x, auto& y) { return x.first > y.first; });
+            for (size_t t = 0; t < rb.size() && t < 10; ++t) {
+                uint64_t key = rb[t].second;
+                ImportLog::Get().Printf("M60 GPU lectura destino=%08X %ux%u %s MB=%.1f n=%llu", (uint32_t)(key >> 32), (uint32_t)((key >> 16) & 0x7FFF), (uint32_t)(key & 0xFFFF),
+                                        (key & 0x80000000u) ? "prof" : "color", rb[t].first / 1048576.0, (unsigned long long)tsResolveBytes[key].second);
+            }
+            tsResolveBytes.clear();
+            for (auto& kv : tsTexFlush)
+                ImportLog::Get().Printf("M60 vaciado por textura base=%08X fmt=%s %ux%u n=%llu", (uint32_t)(kv.first >> 32), TexFmtName((uint32_t)((kv.first >> 26) & 63)),
+                                        (uint32_t)((kv.first >> 13) & 0x1FFF), (uint32_t)(kv.first & 0x1FFF), (unsigned long long)kv.second);
+            tsTexFlush.clear();
+            static const char* rn[16] = {"otro", "INTERRUPT", "XE_SWAP", "WAIT_REG_MEM", "REG_TO_MEM", "MEM_WRITE", "COND_WRITE", "EVENT_WRITE_SHD", "EVENT_WRITE_EXT", "fin_lote", "textura", "memoria", "bufer_lleno", "OnSwap", "presentacion", "WAIT_MEM"};
+            char sb[700]; int sn = std::snprintf(sb, sizeof(sb), "M60 vaciados con resolves pendientes:");
+            for (int r = 0; r < 16; ++r) if (tsSyncN[r] && sn < (int)sizeof(sb) - 60) sn += std::snprintf(sb + sn, sizeof(sb) - sn, " %s=%llu/%.1fms", rn[r], (unsigned long long)tsSyncN[r], tsSyncMs[r]);
+            if (sn < (int)sizeof(sb) - 40) sn += std::snprintf(sb + sn, sizeof(sb) - sn, " (hasta_fin_GPU=%.1fms)", tsSyncGpuMs);
+            {
+                LARGE_INTEGER qf; QueryPerformanceFrequency(&qf);
+                uint64_t bt = wrBusyTicks.exchange(0), c = wrCount.exchange(0), by = wrBytes.exchange(0);
+                if (sn < (int)sizeof(sb) - 80) sn += std::snprintf(sb + sn, sizeof(sb) - sn, " escritor: %.1f ms, %llu resolves, %.1f MB", bt * 1000.0 / (double)qf.QuadPart, (unsigned long long)c, by / 1048576.0);
+            }
+            ImportLog::Get().Printf("%s", sb);
+            for (int r = 0; r < 16; ++r) { tsSyncN[r] = 0; tsSyncMs[r] = 0; }
+            tsSyncGpuMs = 0;
+        }
+        tsBusyTicks = 0; tsLists = 0; tsPrint = now; tsTagTicks.clear();
+        for (double& c : tsCatTicks) c = 0;
+    }
+}
+
+// ---- M60: presentacion desde la copia GPU del resolve del frontbuffer ----
+bool g_strictResolveSync = false;   // M60: --strict-resolve-sync (vaciado de resolves tambien en XE_SWAP, INTERRUPT, WAIT_REG_MEM y fin de lote, como M8)
+bool g_presentVerify = false;       // M60: --present-verify
+uint32_t g_dumpEveryMs = 0, g_dumpFromS = 0, g_dumpForS = 30;   // M60: --dump-every-ms N --dump-from-s T [--dump-for-s D]
+static const char* kBlitCsHlsl = R"(
+cbuffer C : register(b0) { uint w; uint h; };
+Texture2D<float4> src : register(t0);
+RWTexture2D<unorm float4> dst : register(u0);
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= w || id.y >= h) return;
+    dst[id.xy] = src.Load(int3(id.xy, 0));
+}
+)";
+bool D3D12Backend::EnsureBlitCs() {
+    if (csBlitPso) return true;
+    if (csBlitTried) return false;
+    csBlitTried = true;
+    D3D12_DESCRIPTOR_RANGE r[2] = {};
+    r[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; r[0].NumDescriptors = 1;
+    r[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; r[1].NumDescriptors = 1;
+    D3D12_ROOT_PARAMETER p[3] = {};
+    p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; p[0].Constants = {0, 0, 2}; p[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; p[1].DescriptorTable = {1, &r[0]}; p[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; p[2].DescriptorTable = {1, &r[1]}; p[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rs = {}; rs.NumParameters = 3; rs.pParameters = p;
+    ComPtr<ID3DBlob> blob, err;
+    if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err))) return false;
+    if (!Hr(dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&csBlitRootSig)), "CreateRootSignature(blit)")) return false;
+    std::string dxil, e;
+    if (!CompileHlslProfile(kBlitCsHlsl, L"cs_6_0", dxil, e)) { ImportLog::Get().Printf("M60 CS de presentacion: compilacion fallida: %s", e.c_str()); return false; }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC d = {}; d.pRootSignature = csBlitRootSig.Get(); d.CS = {dxil.data(), dxil.size()};
+    if (!Hr(dev->CreateComputePipelineState(&d, IID_PPV_ARGS(&csBlitPso)), "CreateComputePipelineState(blit)")) { csBlitPso.Reset(); return false; }
+    ImportLog::Get().Printf("M60 CS de presentacion listo (DXIL %zu bytes)", dxil.size());
+    return true;
+}
+// Mismo resultado que DecodeFrontbuffer (k_8_8_8_8 en mosaico): el SRV del atajo aplica el endian (coincidente con el del resolve)
+// y el swizzle de la constante de fetch del frontbuffer; la textura del atajo es igual bit a bit a la destilada (--verify-shortcut).
+bool D3D12Backend::PresentFromResolvedTex(const backend::SwapInfo& s) {
+    xenos::xe_gpu_texture_fetch_t t;
+    std::memcpy(&t, s.fetch, sizeof(t));
+    if ((uint32_t)t.format != 6 || !t.tiled || !s.w || !s.h) return false;
+    uint32_t pitchPx = (uint32_t)t.pitch * 32;
+    if (pitchPx < s.w) pitchPx = (s.w + 31) & ~31u;
+    uint32_t pitchAligned = (pitchPx + 31) & ~31u;
+    HostTexture* ht = LookupResolvedTex(s.fbPhys, s.w, s.h, 6, (uint32_t)t.endianness, pitchAligned, (uint32_t)t.swizzle);
+    if (!ht || !EnsureBlitCs()) return false;
+    uint32_t base = AllocGpuSrv(2);
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu0 = gpuSrvHeap->GetCPUDescriptorHandleForHeapStart(); cpu0.ptr += (SIZE_T)base * srvInc;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu1 = cpu0; cpu1.ptr += srvInc;
+    D3D12_GPU_DESCRIPTOR_HANDLE g0 = gpuSrvHeap->GetGPUDescriptorHandleForHeapStart(); g0.ptr += (UINT64)base * srvInc;
+    D3D12_GPU_DESCRIPTOR_HANDLE g1 = g0; g1.ptr += srvInc;
+    D3D12_CPU_DESCRIPTOR_HANDLE srcSrv = cpuSrvHeap->GetCPUDescriptorHandleForHeapStart(); srcSrv.ptr += (SIZE_T)ht->cpuSrv * srvInc;
+    dev->CopyDescriptorsSimple(1, cpu0, srcSrv, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {}; ud.Format = DXGI_FORMAT_R8G8B8A8_UNORM; ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    dev->CreateUnorderedAccessView(frameRT.Get(), nullptr, &ud, cpu1);
+    SetFrameRTState(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    uint32_t c[2] = {std::min(s.w, kW), std::min(s.h, kH)};
+    cl->SetComputeRootSignature(csBlitRootSig.Get());
+    cl->SetPipelineState(csBlitPso.Get());
+    cl->SetComputeRoot32BitConstants(0, 2, c, 0);
+    cl->SetComputeRootDescriptorTable(1, g0);
+    cl->SetComputeRootDescriptorTable(2, g1);
+    cl->Dispatch((c[0] + 7) / 8, (c[1] + 7) / 8, 1);
+    return true;
+}
+void D3D12Backend::ViewerHarvest() {
+    if (!viewerPending || !viewerFence || fence->GetCompletedValue() < viewerFence) return;
+    void* p = nullptr; D3D12_RANGE rr = {0, (SIZE_T)kW * 4 * kH};
+    if (Hr(viewerReadback->Map(0, &rr, &p), "Map(visor)")) {
+        viewer::OnFrame((const uint8_t*)p, kW * 4, viewerW, viewerH, viewerFrame);
+        D3D12_RANGE wz = {0, 0}; viewerReadback->Unmap(0, &wz);
+    }
+    viewerPending = false;
+}
+
 uint64_t D3D12Backend::Submit() {
     ID3D12CommandList* l[] = {cl.Get()};
     queue->ExecuteCommandLists(1, l);
     queue->Signal(fence.Get(), ++fenceValue);
+    if (tsOpen) { for (uint64_t q = tsListFirst; q < tsNext; ++q) tsFence[q % kTsSlots] = fenceValue; tsOpen = false; }   // M60
     if (curAlloc >= 0) allocPool[curAlloc].fence = fenceValue;
     drawsSinceKick = 0;
     return fenceValue;
@@ -230,11 +426,14 @@ void D3D12Backend::BeginList(bool newSection) {
     if (newSection) { uploadOffset = 0; uploadBytesFrame = 0; }
     ID3D12DescriptorHeap* heaps[] = {gpuSrvHeap.Get(), gpuSmpHeap.Get()};
     cl->SetDescriptorHeaps(2, heaps);
+    TsBegin();   // M60
 }
 unsigned g_kickDraws = 64;   // M8: --kick-draws N (0 = sin envios parciales)
 unsigned g_kickResolveDraws = 32;   // M8: --kick-resolve-draws N (envio tras un resolve si hay >= N draws sin enviar)
 void D3D12Backend::Kick() {
     if (!clOpen) return;
+    if (g_eagerIssue && g_asyncResolveWriter && resolveStage) { IssueCopies(true); wrCv.notify_all(); }   // M60: el escritor avanza durante el fotograma
+    TsEnd();   // M60
     Hr(cl->Close(), "CommandList::Close (kick)");
     clOpen = false;
     uint64_t fv = Submit();
@@ -244,11 +443,15 @@ void D3D12Backend::Kick() {
 }
 void D3D12Backend::FlushAndWait() {
     if (!clOpen) return;
+    ++tsFlushWaits;   // M60
+    rt::gpu::M60Event('K');
+    TsEnd();   // M60
     Hr(cl->Close(), "CommandList::Close (flush)");
     clOpen = false;
     uint64_t fv = Submit();
     allocFence[frameSlot] = fv;
     WaitFence(fv);
+    rt::gpu::M60Event('k');
     gpuSrvNext = 0;   // toda la GPU esta ociosa: se pueden reutilizar los descriptores
     gpuSmpNext = 0; samplerTables.clear(); samplerFast.clear();
     BeginList();
@@ -285,6 +488,7 @@ void D3D12Backend::EnsureMemory(uint32_t phys, uint32_t bytes) {
     uint64_t end = (uint64_t)phys + bytes;
     if (end > kSharedMemBytes) end = kSharedMemBytes;
     uint32_t p0 = phys >> 12, p1 = (uint32_t)((end + 4095) >> 12);
+    rt::gpu::g_syncReason = 11;
     FlushResolvesIfOverlap(p0 << 12, (uint32_t)std::min<uint64_t>((uint64_t)p1 << 12, kSharedMemBytes));   // M8: exactitud con resolves diferidos
     uint32_t runStart = 0; bool inRun = false;
     const uint8_t* whole = PhysHost(p0 << 12, (p1 - p0) * 4096);   // M8: una sola comprobacion para todo el rango
@@ -297,6 +501,7 @@ void D3D12Backend::EnsureMemory(uint32_t phys, uint32_t bytes) {
         std::memcpy(u.cpu, src, n);
         SetSharedState(D3D12_RESOURCE_STATE_COPY_DEST);
         cl->CopyBufferRegion(sharedMem.Get(), (UINT64)from << 12, uploadBuf.Get(), u.offset, n);
+        TsMark(4, 0);   // M60
         pagesUploaded += to - from;
     };
     for (uint32_t pg = p0; pg < p1; ++pg) {
@@ -338,14 +543,53 @@ void D3D12Backend::OnDraw(const DrawEvent& ev, const ShaderInfo* vs, const Shade
     ++drawSerial;
     if (DoDraw(ev, vs, ps)) { ++drawsOk; ++fDrawsOk; }
     else { ++drawsSkip; ++fDrawsSkip; }
+    TsMark(1, ps ? ps->hash : (vs ? vs->hash : 0));   // M60
     if (g_kickDraws && ++drawsSinceKick >= g_kickDraws) Kick();   // M8: la GPU empieza a trabajar mientras el CP sigue
 }
 
 void D3D12Backend::OnSwap(const backend::SwapInfo& s) {
     PERF_ZONE(kZoneSwapTotal);
-    FlushResolves();                                        // M8 (ya vaciado en el punto de sincronizacion de XE_SWAP)
-    for (auto& kv : resolvedTex) kv.second.valid = false;   // M8: el atajo solo vale dentro del fotograma del resolve
+    ViewerHarvest();   // M60: imagen pedida a la GPU en un fotograma anterior
+    rt::gpu::g_syncReason = 13;
+    if (g_strictResolveSync || !g_asyncResolveWriter) FlushResolves();   // M8 (ya vaciado en XE_SWAP); M60: solo con --strict-resolve-sync
+    rt::gpu::g_syncReason = 0;
     BeginList();
+    bool gpuPresented = false;
+    if (!opt.clearTest && !g_strictResolveSync && g_asyncResolveWriter) {   // M60
+        gpuPresented = PresentFromResolvedTex(s);
+        if (gpuPresented) ++presentGpu;
+    }
+    if (g_presentVerify && gpuPresented) {   // M60: compara la imagen de la GPU con DecodeFrontbuffer tras escribir los resolves
+        rt::gpu::g_syncReason = 14; FlushResolves();
+        SetFrameRTState(D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+        dst.pResource = readback.Get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, kW, kH, 1, kW * 4};
+        src.pResource = frameRT.Get(); src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
+        cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        FlushAndWait();
+        FbDesc d; for (int i = 0; i < 6; ++i) d.fetch[i] = s.fetch[i];
+        d.phys = s.fbPhys; d.w = s.w; d.h = s.h;
+        std::string info;
+        if (DecodeFrontbuffer(d, fbScratch, &info)) {
+            void* p = nullptr; D3D12_RANGE rr = {0, (SIZE_T)kW * 4 * kH};
+            if (Hr(readback->Map(0, &rr, &p), "Map(present-verify)")) {
+                uint32_t cw = std::min(s.w, kW), ch = std::min(s.h, kH);
+                uint64_t diff = 0;
+                for (uint32_t y = 0; y < ch; ++y)
+                    for (uint32_t x = 0; x < cw; ++x)
+                        diff += std::memcmp((const uint8_t*)p + (size_t)y * kW * 4 + x * 4, fbScratch.data() + ((size_t)y * s.w + x) * 4, 4) != 0;
+                D3D12_RANGE wz = {0, 0}; readback->Unmap(0, &wz);
+                static uint64_t vOk = 0, vBad = 0;
+                ++(diff ? vBad : vOk);
+                if (diff || vOk <= 3 || vOk % 200 == 0)
+                    ImportLog::Get().Printf("M60 present-verify frame=%llu %ux%u -> %s (pixeles distintos=%llu; ok=%llu mal=%llu)", (unsigned long long)s.frame, cw, ch,
+                                            diff ? "DISTINTO" : "IGUAL", (unsigned long long)diff, (unsigned long long)vOk, (unsigned long long)vBad);
+            }
+        }
+    }
+    for (auto& kv : resolvedTex) kv.second.valid = false;   // M8: el atajo solo vale dentro del fotograma del resolve
+    predPrev.swap(predCur); predCur.clear();   // M60
     // ---- imagen del fotograma ----
     const char* source = "nada";
     if (opt.clearTest) {
@@ -360,7 +604,28 @@ void D3D12Backend::OnSwap(const backend::SwapInfo& s) {
         for (auto& r : resolveImages)
             if (r.destBase == s.fbPhys && r.w >= s.w && r.h >= s.h && !r.rgba.empty()) ri = &r;
         std::vector<uint8_t>& rgba = fbScratch;   // M8: reutilizado (antes 3,6 MB nuevos por fotograma)
-        if (ri && ri->x0 == 0 && ri->y0 == 0 && ri->w == s.w) {
+        if (gpuPresented) {   // M60
+            source = "resolve-gpu";
+            if (viewer::WantsFrame() && !viewerPending) {   // copia asincrona para el visor (se entrega en un OnSwap posterior)
+                if (!viewerReadback) {
+                    D3D12_HEAP_PROPERTIES rp = {D3D12_HEAP_TYPE_READBACK};
+                    D3D12_RESOURCE_DESC bd = {};
+                    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = (UINT64)kW * 4 * kH; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+                    bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                    Hr(dev->CreateCommittedResource(&rp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&viewerReadback)), "readback del visor");
+                }
+                if (viewerReadback) {
+                    SetFrameRTState(D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+                    dst.pResource = viewerReadback.Get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                    dst.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, kW, kH, 1, kW * 4};
+                    src.pResource = frameRT.Get(); src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
+                    cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                    viewerPending = true; viewerFence = 0; viewerFrame = s.frame;
+                    viewerW = std::min(s.w, kW); viewerH = std::min(s.h, kH);
+                }
+            }
+        } else if (ri && ri->x0 == 0 && ri->y0 == 0 && ri->w == s.w) {
             source = "resolve";
             viewer::OnFrame(ri->rgba.data(), ri->w * 4, std::min(ri->w, kW), std::min(std::min(ri->h, s.h), kH), s.frame);
             PresentFromRgba(ri->rgba.data(), ri->w, std::min(ri->h, s.h));
@@ -370,12 +635,21 @@ void D3D12Backend::OnSwap(const backend::SwapInfo& s) {
             d.phys = s.fbPhys; d.w = s.w; d.h = s.h;
             std::string info;
             bool okfb;
+            if (!g_strictResolveSync) { rt::gpu::g_syncReason = 14; FlushResolves(); ++presentCpu; }   // M60: lectura del frontbuffer en memoria guest
             { PERF_ZONE(kZoneFbDecode); okfb = DecodeFrontbuffer(d, rgba, &info); }
             if (okfb) { source = "frontbuffer"; viewer::OnFrame(rgba.data(), s.w * 4, std::min(s.w, kW), std::min(s.h, kH), s.frame); PresentFromRgba(rgba.data(), s.w, s.h); }
             else Note("OMISION presentacion: no se pudo destilar el frontbuffer (" + info + ")");
         }
     }
+    TsMark(6, 0);   // M60
     bool dump = dumpSet.count((uint32_t)s.frame) != 0;
+    if (g_dumpEveryMs) {   // M60: volcado por reloj (--dump-every-ms N --dump-from-s T), para comparar animaciones entre ritmos
+        static LARGE_INTEGER t0{}, nextT{}; LARGE_INTEGER f, now; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&now);
+        if (!t0.QuadPart) { t0 = now; nextT.QuadPart = now.QuadPart + (LONGLONG)g_dumpFromS * f.QuadPart; }
+        if (now.QuadPart >= nextT.QuadPart && now.QuadPart < t0.QuadPart + (LONGLONG)(g_dumpFromS + g_dumpForS) * f.QuadPart) {
+            dump = true; nextT.QuadPart = now.QuadPart + (LONGLONG)g_dumpEveryMs * f.QuadPart / 1000;
+        }
+    }
     bool wantStats = opt.stats || dump;
     UINT bbIdx = 0;
     if (swap) {
@@ -394,10 +668,12 @@ void D3D12Backend::OnSwap(const backend::SwapInfo& s) {
         cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     }
     SetFrameRTState(D3D12_RESOURCE_STATE_RENDER_TARGET);
+    TsEnd();   // M60
     Hr(cl->Close(), "CommandList::Close");
     clOpen = false;
     uint64_t fv = Submit();
     allocFence[frameSlot] = fv;
+    if (viewerPending && !viewerFence) viewerFence = fv;   // M60
     frameSlot = (frameSlot + 1) % kFramesInFlight;
     if (swap) { PERF_ZONE(kZonePresent); Hr(swap->Present(1, 0), "Present"); ++presentCalls; }
     ++framesPresented;
@@ -439,11 +715,14 @@ void D3D12Backend::OnSwap(const backend::SwapInfo& s) {
     texMemo.clear();
     frameResolves.clear(); fTexCalls = fTexOverlap = fTexExact = 0;
     fDrawsOk = fDrawsSkip = fShaderFail = fPsoFail = fResolve = fHrFail = fTexFail = 0;
+    TsHarvest();   // M60
 }
 
 void D3D12Backend::Shutdown() {
     if (!dev) return;
+    rt::gpu::g_syncReason = 0;
     FlushResolves();
+    ImportLog::Get().Printf("M60 presentacion: desde_GPU=%llu desde_memoria=%llu escrituras_ordenadas=%llu", (unsigned long long)presentGpu, (unsigned long long)presentCpu, (unsigned long long)orderedWrites);
     if (wrThread.joinable()) { { std::lock_guard<std::mutex> g(wrMu); wrStop = true; } wrCv.notify_all(); wrThread.join(); }
     ImportLog::Get().Printf("M8 envios parciales (kick)=%llu asignadores=%zu", (unsigned long long)kicks, allocPool.size());
     ImportLog::Get().Printf("M8 resolves: escritos=%llu omitidos_por_cubiertos=%llu vaciados_por_lectura=%llu atajo_gpu=%llu subcopias=%llu",
@@ -457,6 +736,7 @@ void D3D12Backend::Shutdown() {
     ImportLog::Get().Printf("D3D12 memoria: paginas_subidas=%llu paginas_sin_cambios=%llu bytes_subidos=%llu texturas_creadas=%llu texturas_reutilizadas=%llu psos=%zu dxil=%zu rt_color=%zu rt_profundidad=%zu",
                             (unsigned long long)pagesUploaded, (unsigned long long)pagesSkipped, (unsigned long long)uploadBytesTotal, (unsigned long long)texCreated,
                             (unsigned long long)texHits, psoCache.size(), dxilCache.size(), colorRTs.size(), depthRTs.size());
+    for (auto& kv : notesLit) notes[kv.first] += kv.second;   // M60
     for (auto& kv : notes) ImportLog::Get().Printf("D3D12 NOTA n=%llu %s", (unsigned long long)kv.second, kv.first.c_str());
     backend::Set(nullptr);
     ui.Stop();

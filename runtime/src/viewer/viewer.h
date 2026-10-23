@@ -33,6 +33,9 @@ extern std::atomic<bool> g_active;
 // Llamado por el hilo del CP con el RGBA ya destilado (stride en bytes; cw x ch = region util).
 void OnFrame(const uint8_t* rgba, uint32_t stride, uint32_t cw, uint32_t ch, uint64_t frame);
 
+// M60: true si el siguiente OnFrame se aceptaria (cliente conectado y ritmo cumplido); permite pedir la imagen a la GPU por adelantado.
+bool WantsFrame();
+
 // Botones del navegador (mascara XINPUT_GAMEPAD); 0 si caducados (>500 ms sin latido) o sin --viewer-input.
 uint16_t Buttons();
 

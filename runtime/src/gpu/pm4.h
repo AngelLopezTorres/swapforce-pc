@@ -49,6 +49,10 @@ struct Pm4Host {
     virtual void OnDraw(const DrawEvent&) {}                        // tras actualizar VGT_DRAW_INITIATOR/DMA
     virtual void MemWritten(uint32_t /*phys*/, uint32_t /*bytes*/) {}   // M8: el CP escribio memoria guest (invalidacion de caches)
     virtual void SyncPoint() {}                                     // M8: punto en que la CPU guest puede observar el trabajo previo
+    // M60: escritura del CP en memoria guest ordenada tras los resolves pendientes (semantica de fin de canalizacion). true = encolada
+    // por el backend (el CP no debe escribir); false = escribir ahora. ReadBarrier: el CP va a leer [phys, phys+bytes).
+    virtual bool WriteOrdered(uint32_t /*phys*/, const void* /*data*/, uint32_t /*bytes*/) { return false; }
+    virtual void ReadBarrier(uint32_t /*phys*/, uint32_t /*bytes*/) {}
 };
 
 struct Pm4Stats {

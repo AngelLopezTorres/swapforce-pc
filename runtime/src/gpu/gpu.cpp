@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <mmsystem.h>
 
+#include <algorithm>
 #include <atomic>
 #include <map>
 #include <memory>
@@ -21,6 +22,8 @@
 #include "pm4.h"
 #include "ucode_info.h"
 #include "fb_decode.h"
+namespace rt::gpu::d3d { extern bool g_gpuTiming; }
+namespace rt::gpu { extern int g_syncReason; }   // M60 (d3d12_backend.cpp)
 #include "gpu_names.h"
 #include "image_io.h"
 #include "backend.h"
@@ -45,6 +48,7 @@ void Set(Backend* b) { g_b = b; }
 } // namespace backend
 
 namespace {
+void TraceSwapState(const char* tag, uint64_t n, std::atomic<uint64_t>& ctr);   // M60 (definida con VsyncMain)
 
 constexpr uint32_t kGuestRegWords = 0x4000;       // 64 KB / 4
 constexpr uint32_t REG_CP_RB_WPTR = 0x01C5;        // graphics_system.cc WriteRegister
@@ -118,6 +122,33 @@ void DispatchInterrupt(uint32_t source, uint32_t cpu) {
         t_ctx->Attach();
     }
     t_ctx->SetCpu(cpu == 0xFFFFFFFF ? 2 : cpu); // Xenia: cpu por defecto 2
+    if (source == 1) M60Event('I');
+    if (source == 1 && Cfg().swapInterval) {
+        // M60 --swap-interval N: el manejador de interrupcion del CP del juego (sub_82F58198, fuente 1) llama a [blk+16] con r3 = [blk+20],
+        // blk = [dev+11028], dev = userData del callback. Si [blk+16] es el envio de volteo (sub_82F5C258), r3 = frontbuffer | intervalo<<8 |
+        // umbral (sub_82F5C258: r29 = (r3>>8)&0xF, r27 = r3&0xFF, r30 = r3&0xFFFFF000). Se sustituye el intervalo antes de la llamada.
+        uint8_t* b = GuestMemory::Base();
+        auto R = [&](uint32_t a) { return __builtin_bswap32(*reinterpret_cast<uint32_t*>(b + a)); };
+        uint32_t dev = g_cbData;
+        if (dev >= 0x40000000u && dev < 0xA0000000u) {
+            uint32_t blk = R(dev + 11028);
+            if (blk >= 0x40000000u && blk < 0xE0000000u && R(blk + 16) == 0x82F5C258u) {
+                uint32_t v = R(blk + 20);
+                uint32_t nv = (v & ~0xF00u) | (Cfg().swapInterval << 8);
+                if (nv != v) GuestMemory::Write32(blk + 20, nv);
+                if (rt::gpu::d3d::g_gpuTiming) {   // M60 diagnostico: volteo tardio = el vencimiento ideal (ultimo + intervalo) ya paso
+                    static uint32_t tot = 0, late = 0; static uint64_t lastV = 0;
+                    uint32_t lastDue = R(dev + 16960), cur = R(dev + 16952);
+                    ++tot;
+                    if (lastDue + Cfg().swapInterval <= cur) { ++late; static int nd = 0; if (nd < 30 && g_frames.load() > 1600) { ++nd; M60DumpEvents("volteo tardio"); } }
+                    uint64_t vb = g_vblank.load();
+                    if (vb - lastV >= 60) { ImportLog::Get().Printf("M60 volteos tardios=%u de %u", late, tot); tot = late = 0; lastV = vb; }
+                }
+                static uint64_t n = 0;
+                if (++n <= 3) ImportLog::Get().Printf("M60 swap-interval: argumento de volteo %08X -> %08X", v, nv);
+            }
+        }
+    }
     t_ctx->CallGuest(cb, source, g_cbData);
 }
 
@@ -160,6 +191,8 @@ struct CpHost : Pm4Host {
         ++g_counter;
         perf::OnFrame(n);
         ImportLog::Get().Printf("FRAME %llu fb=%08X %ux%u", (unsigned long long)n, fb, w, h);
+        if (Cfg().traceSwap) { static std::atomic<uint64_t> ctrSw{0}; TraceSwapState("SWAP", n, ctrSw); }
+        M60Event('S');
         if (Cfg().dumpFb) DumpFrontbuffer(n, fb, w, h);
         if (backend::Get()) {
             backend::SwapInfo si;
@@ -310,6 +343,8 @@ struct CpHost : Pm4Host {
     }
     void Log(const char* line) override { GpuLogLine(line); }
     void MemWritten(uint32_t a, uint32_t n) override { if (backend::Get()) backend::Get()->MemWritten(a, n); }
+    bool WriteOrdered(uint32_t a, const void* d, uint32_t n) override { return backend::Get() && backend::Get()->WriteOrdered(a, d, n); }   // M60
+    void ReadBarrier(uint32_t a, uint32_t n) override { if (backend::Get()) backend::Get()->ReadBarrier(a, n); }                         // M60
     void SyncPoint() override { if (backend::Get()) backend::Get()->SyncPoint(); }
     void FrameDone(const char* s) override { GpuLogLine(s); }
 };
@@ -329,16 +364,35 @@ DWORD WINAPI CpMain(void*) {
     CpHost host;
     Pm4Parser parser(&host);
     parser.SetLogLimit(Cfg().logPerFrame);
+    // M60 (--gpu-timing): tiempo del CP sin trabajo (anillo vacio) y en lotes, por segundo
+    LARGE_INTEGER qf, tPrint, t0, t1; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&tPrint);
+    double idleS = 0, batchS = 0; uint64_t idleN = 0;
+    auto statTick = [&]() {
+        if (!rt::gpu::d3d::g_gpuTiming) return;
+        LARGE_INTEGER n; QueryPerformanceCounter(&n);
+        double el = (double)(n.QuadPart - tPrint.QuadPart) / (double)qf.QuadPart;
+        if (el < 1.0) return;
+        ImportLog::Get().Printf("M60 CP anillo_vacio_ms=%.1f (esperas=%llu, media_us=%.0f) lotes_ms=%.1f en %.2f s", idleS * 1000, (unsigned long long)idleN,
+                                idleN ? idleS * 1e6 / (double)idleN : 0.0, batchS * 1000, el);
+        idleS = batchS = 0; idleN = 0; tPrint = n;
+    };
     while (g_running) {
         SyncFromGuest();
         uint32_t w = g_wptr, ringBytes = g_ringBytes, ringPhys = g_ringPhys;
-        if (!ringBytes || w == 0xBAADF00D || w == g_rptr) { Sleep(1); continue; }
+        if (!ringBytes || w == 0xBAADF00D || w == g_rptr) {
+            QueryPerformanceCounter(&t0); Sleep(1); QueryPerformanceCounter(&t1);
+            idleS += (double)(t1.QuadPart - t0.QuadPart) / (double)qf.QuadPart; ++idleN; statTick();
+            continue;
+        }
+        QueryPerformanceCounter(&t0);
+        M60Event('L');
         uint8_t* ring = PhysHost(ringPhys, ringBytes);
         if (!ring) { ImportLog::Get().Printf("RB: anillo %08X+%X no asignado", ringPhys, ringBytes); Sleep(100); continue; }
         uint32_t capD = ringBytes / 4;
         if (w >= capD) { ImportLog::Get().Printf("RB: wptr=0x%X fuera del anillo (%u dwords), se usa modulo", w, capD); }
         uint32_t rd = g_rptr;
         SafeExecute(&parser, ring, ringBytes, rd, w);
+        g_syncReason = 9;   // M60 diagnostico
         if (backend::Get()) backend::Get()->SyncPoint();   // M8: antes de publicar el rptr (la CPU puede observar el fin del lote)
         uint32_t newR = w % capD;
         g_rptr = newR;
@@ -346,6 +400,7 @@ DWORD WINAPI CpMain(void*) {
         if (wb) {
             if (uint8_t* p = PhysHost(wb, 4)) { uint32_t be = __builtin_bswap32(newR); std::memcpy(p, &be, 4); }
         }
+        QueryPerformanceCounter(&t1); batchS += (double)(t1.QuadPart - t0.QuadPart) / (double)qf.QuadPart; statTick();
         uint64_t b = ++g_batches;
         if (b <= 40 || b % 500 == 0) ImportLog::Get().Printf("RB wptr=%u rptr=%u (lote %llu, desde rptr=%u)", w, newR, (unsigned long long)b, rd);
     }
@@ -353,26 +408,79 @@ DWORD WINAPI CpMain(void*) {
     return 0;
 }
 
+// M60: estado de la cola de volteo del juego (dispositivo D3D guest). Direcciones de ppc_gen/sub_82F5C258, sub_82F5C128.
+// dev = *(*(0x8200088C)) (rama r11=2188). Solo diagnostico (lectura de memoria guest desde el hilo de VBLANK).
+void TraceSwapState(const char* tag, uint64_t n, std::atomic<uint64_t>& ctr) {
+    uint64_t c = ++ctr;
+    if (c > 400 && (c % 50) != 0) return;
+    uint8_t* b = GuestMemory::Base();
+    auto R = [&](uint32_t a) { return __builtin_bswap32(*reinterpret_cast<uint32_t*>(b + a)); };
+    // El manejador VBLANK recibe como r3 el userData del callback (VdSetGraphicsInterruptCallback): ese valor es el dispositivo.
+    uint32_t dev = g_cbData;
+    if (dev < 0x40000000u || dev >= 0xA0000000u) { ImportLog::Get().Printf("SWT %s n=%llu dev=%08X (no valido)", tag, (unsigned long long)n, dev); return; }
+    ImportLog::Get().Printf("SWT %s n=%llu vbg=%u gst(16952)=%u last_due(16960)=%u sub(16968)=%u sub2(16972)=%u flip(16976)=%u rd(17108)=%u wr(17112)=%u q0=(%u,%u) q1=(%u,%u) q2=(%u,%u)",
+        tag, (unsigned long long)n, (unsigned)g_vblank.load(), R(dev + 16952), R(dev + 16960), R(dev + 16968), R(dev + 16972), R(dev + 16976),
+        R(dev + 17108), R(dev + 17112), R(dev + 16980), R(dev + 16984), R(dev + 16988), R(dev + 16992), R(dev + 16996), R(dev + 17000));
+}
+
+
 DWORD WINAPI VsyncMain(void*) {
     perf::NameCurrentThread("gpu-vsync");
     LARGE_INTEGER f, last, now;
     QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&last);
-    const LONGLONG period = f.QuadPart / 60;
+    const LONGLONG period = f.QuadPart / (Cfg().vblankHz ? Cfg().vblankHz : 60);
+    // M60: espera hasta el siguiente vencimiento con temporizador de alta resolucion (antes Sleep(1): intervalos medidos 15,2-18,0 ms)
+    HANDLE vtm = Cfg().legacyVsync ? nullptr : CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     while (g_running) {
         QueryPerformanceCounter(&now);
+        if (vtm && now.QuadPart - last.QuadPart < period) {
+            LONGLONG rem = period - (now.QuadPart - last.QuadPart);            // en ticks de QPC
+            LARGE_INTEGER due; due.QuadPart = -(rem * 10000000LL / f.QuadPart);  // 100 ns, relativo
+            if (due.QuadPart < 0 && SetWaitableTimer(vtm, &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(vtm, 100);
+            QueryPerformanceCounter(&now);
+        }
         if (now.QuadPart - last.QuadPart >= period) {
             last.QuadPart += period;
             if (now.QuadPart - last.QuadPart > period * 4) last = now; // evita rafagas tras una pausa
             ++g_vblank;
             ++g_counter;               // Xenia: command_processor_->increment_counter()
+            if (rt::gpu::d3d::g_gpuTiming) {   // M60 diagnostico: regularidad del VBLANK (intervalo real entre interrupciones)
+                static LARGE_INTEGER prev{}; static double mn = 1e9, mx = 0; static uint32_t cnt = 0, early = 0, late = 0;
+                if (prev.QuadPart) {
+                    double ms = (double)(now.QuadPart - prev.QuadPart) * 1000.0 / (double)f.QuadPart;
+                    mn = std::min(mn, ms); mx = std::max(mx, ms); ++cnt;
+                    if (ms < 0.5 * 1000.0 / (Cfg().vblankHz ? Cfg().vblankHz : 60)) ++early;
+                    if (ms > 1.5 * 1000.0 / (Cfg().vblankHz ? Cfg().vblankHz : 60)) ++late;
+                    if (cnt >= (Cfg().vblankHz ? Cfg().vblankHz : 60)) {
+                        ImportLog::Get().Printf("M60 VBLANK intervalo_ms min=%.2f max=%.2f tempranos=%u tardios=%u (de %u) esperas_marca=%llu (%.2f ms)", mn, mx, early, late, cnt,
+                                                (unsigned long long)g_vbWaits.exchange(0), (double)g_vbWaitTicks.exchange(0) * 1000.0 / (double)f.QuadPart);
+                        mn = 1e9; mx = 0; cnt = early = late = 0;
+                    }
+                }
+                prev = now;
+            }
+            if (Cfg().traceSwap) { static std::atomic<uint64_t> ctrVb{0}; TraceSwapState("VB", g_vblank, ctrVb); }
             // M8: el barrido de contenedores de shaders (fase 4a, diagnostico) bloqueaba este hilo ~1 s a los 10 s y 30 s y, con el,
             // las interrupciones de VBLANK que el juego usa para voltear: ahora solo con --shader-scan.
             if (Cfg().shaderScan && (g_vblank == 600 || g_vblank == 1800)) ScanShaderContainers(g_vblank == 600 ? "10 s" : "30 s");
+            M60Event('B', (uint32_t)g_vblank.load());
+            if (g_swapMarkDone.load() < g_swapMarkQueued.load()) {   // M60: fotograma aun no completo en memoria guest
+                LARGE_INTEGER w0, w1; QueryPerformanceCounter(&w0);
+                while (g_running && g_swapMarkDone.load() < g_swapMarkQueued.load()) {
+                    QueryPerformanceCounter(&w1);
+                    if (w1.QuadPart - w0.QuadPart > f.QuadPart / 5) { static int nw = 0; if (nw++ < 5) ImportLog::Get().Printf("M60 VBLANK: espera de marca de XE_SWAP > 200 ms; se continua"); break; }
+                    SwitchToThread();
+                }
+                QueryPerformanceCounter(&w1);
+                g_vbWaitTicks += (uint64_t)(w1.QuadPart - w0.QuadPart); ++g_vbWaits;
+                M60Event('b');
+            }
             DispatchInterrupt(0, 2);   // Xenia: DispatchInterruptCallback(0, 2)
         }
-        Sleep(1);
+        if (!vtm) Sleep(1);
     }
+    if (vtm) CloseHandle(vtm);
     return 0;
 }
 
@@ -533,7 +641,30 @@ void EnableReadPointerWriteBack(uint32_t phys, uint32_t blockLog2) {
     ImportLog::Get().Printf("GPU: EnableReadPointerWriteBack phys=%08X block_log2=%u", phys, blockLog2);
 }
 
-void RecordSwapCall() { ++g_swapCalls; }
+void RecordSwapCall() { ++g_swapCalls; M60Event('V'); }
+std::atomic<uint64_t> g_swapMarkQueued{0}, g_swapMarkDone{0};
+// M60 diagnostico: V = VdSwap del juego, B = VBLANK (a = numero), S = XE_SWAP en el CP, I = interrupcion de volteo,
+// F/f = inicio/fin de FlushResolves con espera, K/k = FlushAndWait, L = lote del anillo
+namespace { struct M60Ev { int64_t t; char c; uint32_t a; }; M60Ev g_m60ev[512]; std::atomic<uint32_t> g_m60n{0}; std::mutex g_m60mu; }
+void M60Event(char c, uint32_t a) {
+    if (!rt::gpu::d3d::g_gpuTiming) return;
+    LARGE_INTEGER t; QueryPerformanceCounter(&t);
+    std::lock_guard<std::mutex> g(g_m60mu);
+    uint32_t i = g_m60n++ & 511; g_m60ev[i] = {t.QuadPart, c, a};
+}
+std::atomic<uint64_t> g_vbWaitTicks{0}, g_vbWaits{0};
+void M60DumpEvents(const char* why) {
+    LARGE_INTEGER f, now; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&now);
+    std::string s = std::string("M60 eventos (") + why + "), ms antes de ahora:";
+    std::lock_guard<std::mutex> g(g_m60mu);
+    uint32_t n = g_m60n.load();
+    for (uint32_t k = (n > 60 ? n - 60 : 0); k < n; ++k) {
+        const M60Ev& e = g_m60ev[k & 511];
+        char b[40]; std::snprintf(b, sizeof(b), " %c%s%.1f", e.c, e.c == 'B' ? "" : "@", (double)(now.QuadPart - e.t) * 1000.0 / (double)f.QuadPart);
+        s += b;
+    }
+    ImportLog::Get().Printf("%s", s.c_str());
+}
 
 uint64_t FrameCount() { return g_frames; }
 uint64_t VblankCount() { return g_vblank; }

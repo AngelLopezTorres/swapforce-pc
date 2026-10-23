@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 // Subsistema GPU minimo (Fases 1-4): registros en 0x7FC80000, hilo del procesador de comandos (anillo PM4,
 // puntero de lectura con write-back), hilo de vsync a 60 Hz con callback de interrupcion y analizador PM4.
 // Referencias: Xenia graphics_system.cc, command_processor.cc, xboxkrnl_video.cc (copias en runtime\ref\).
@@ -29,6 +30,11 @@ struct Config {
     uint32_t dumpTextures = 0;     // --dump-textures K
     bool binkTrace = false;        // --bink-trace: BINKPLANE por draw del PS de composicion Bink (M0)
     std::string dumpFrames;        // --dump-frames N[,M..]: PNG del fotograma renderizado por el backend
+    bool traceSwap = false;        // --trace-swap-interval: estado de la cola de volteo guest (VB/SWAP) en gpu.log
+    uint32_t swapInterval = 1;     // --swap-interval N (1-15): M60, intervalo de presentacion (vblancos por volteo) que sustituye al que pide el juego (2).
+                                   // Defecto 1 (60 Hz; ver PROGRESS.md 60 FPS: la logica medida es por tiempo real). 0 = el del juego (30 fps).
+    bool legacyVsync = false;      // M60: --legacy-sleep (VBLANK con Sleep(1), como antes)
+    uint32_t vblankHz = 60;        // --vblank-hz N: frecuencia del hilo de VBLANK (experimento M60; por defecto 60)
 };
 Config& Cfg();
 std::string FramesDir();   // M8: --frames-dir DIR (por defecto runtime/userdata/frames)
@@ -41,6 +47,11 @@ void SetInterruptCallback(uint32_t callback, uint32_t userData);
 void InitializeRingBuffer(uint32_t phys, uint32_t sizeLog2);
 void EnableReadPointerWriteBack(uint32_t phys, uint32_t blockSizeLog2);
 void RecordSwapCall();
+void M60Event(char c, uint32_t a = 0);
+// M60: marcas de XE_SWAP en la cola del escritor de resolves. El VBLANK (que puede voltear) espera a que el escritor haya aplicado
+// todo lo anterior al ultimo XE_SWAP procesado: un fotograma no se muestra (ni el juego recicla su memoria) antes de estar completo.
+extern std::atomic<uint64_t> g_swapMarkQueued, g_swapMarkDone, g_vbWaitTicks, g_vbWaits;   // M60 diagnostico (--gpu-timing): anillo de eventos con marca QPC
+void M60DumpEvents(const char* why);
 
 // Estado observable (pruebas y diagnostico).
 uint64_t FrameCount();

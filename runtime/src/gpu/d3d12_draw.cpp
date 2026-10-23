@@ -71,11 +71,22 @@ bool D3D12Backend::CreateRootSignature() {
     return Hr(dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&rootSig)), "CreateRootSignature");
 }
 
+// M60: anillo de kSrvSegments segmentos. Al entrar en un segmento se espera a la ultima valla que lo uso (normalmente ya cumplida),
+// en lugar de vaciar toda la GPU (FlushAndWait) al llenarse el heap.
 uint32_t D3D12Backend::AllocGpuSrv(uint32_t n) {
-    if (gpuSrvNext + n > kCbvSrvHeapSize) FlushAndWait();   // FlushAndWait reinicia gpuSrvNext
-    uint32_t b = gpuSrvNext;
-    gpuSrvNext += n;
-    return b;
+    constexpr uint32_t seg = kCbvSrvHeapSize / kSrvSegments;
+    uint32_t s0 = gpuSrvNext / seg;
+    uint32_t next = gpuSrvNext;
+    if (next + n > kCbvSrvHeapSize) next = 0;
+    else if ((next + n - 1) / seg != s0) next = (next + n - 1) / seg * seg;
+    uint32_t s1 = next / seg;
+    if (s1 != s0 || next != gpuSrvNext) {
+        if (srvSegFence[s1] > fenceValue) Kick();       // el segmento lo usa la lista abierta (no deberia ocurrir con 4 segmentos)
+        WaitFence(srvSegFence[s1]);
+    }
+    gpuSrvNext = next + n;
+    srvSegFence[s1] = fenceValue + 1;   // la lista abierta se senaliza con el siguiente Submit
+    return next;
 }
 
 // ---- shaders -> DXIL (cache en memoria y en disco por hash) ----
@@ -221,6 +232,7 @@ ID3D12PipelineState* D3D12Backend::GetPso(const ShaderInfo& vsI, const ShaderInf
     auto it = psoCache.find(key);
     if (it != psoCache.end()) { psoFast.emplace(hkey, std::make_pair(key, it->second.Get())); return it->second.Get(); }
     PERF_ZONE(kZonePsoCreate);
+    rt::gpu::M60Event('P');
 
     const DxilBlob* vsB = GetDxil(vsI, -1);
     const DxilBlob* psB = psI ? GetDxil(*psI, pg) : nullptr;

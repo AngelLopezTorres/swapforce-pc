@@ -402,11 +402,12 @@ void ZoneAdd(int z, uint64_t t) {
     g_zoneCalls[z].fetch_add(1, std::memory_order_relaxed);
 }
 
+uint32_t g_tironMs = 100;   // M60: --tiron-ms N (umbral del registro M8 TIRON entre XE_SWAP)
 void OnFrame(uint64_t frame) {
     if (!g_enabled || !S) return;
     static uint64_t last = 0, lastZ[kZoneCount] = {};
     uint64_t now = Now();
-    if (last && now - last > S->qpf / 10) {
+    if (last && now - last > S->qpf * g_tironMs / 1000) {
         char b[600]; int n = std::snprintf(b, sizeof(b), "M8 TIRON frame=%llu dt_ms=%.1f zonas_ms:", (unsigned long long)frame, (now - last) * 1000.0 / S->qpf);
         for (int z = 0; z < kZoneCount && n < (int)sizeof(b) - 40; ++z)
             n += std::snprintf(b + n, sizeof(b) - n, " %s=%.1f", kZoneNames[z], (g_zoneTicks[z].load() - lastZ[z]) * 1000.0 / S->qpf);
@@ -414,6 +415,20 @@ void OnFrame(uint64_t frame) {
     }
     last = now;
     for (int z = 0; z < kZoneCount; ++z) lastZ[z] = g_zoneTicks[z].load();
+    {   // M60: zonas por segundo (ms de cada zona en el ultimo segundo; las zonas pueden anidarse)
+        static uint64_t secT = 0, secF = 0, secZ[kZoneCount] = {};
+        if (!secT) { secT = now; secF = frame; for (int z = 0; z < kZoneCount; ++z) secZ[z] = g_zoneTicks[z].load(); }
+        else if (now - secT >= S->qpf) {
+            char b[700]; int n = std::snprintf(b, sizeof(b), "M60 ZONAS %.2f s frames=%llu ms:", (now - secT) / (double)S->qpf, (unsigned long long)(frame - secF));
+            for (int z = 0; z < kZoneCount && n < (int)sizeof(b) - 40; ++z) {
+                uint64_t v = g_zoneTicks[z].load();
+                n += std::snprintf(b + n, sizeof(b) - n, " %s=%.1f", kZoneNames[z], (v - secZ[z]) * 1000.0 / S->qpf);
+                secZ[z] = v;
+            }
+            ImportLog::Get().Printf("%s", b);
+            secT = now; secF = frame;
+        }
+    }
 }
 
 void NameCurrentThread(const char* name) {

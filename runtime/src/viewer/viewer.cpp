@@ -362,6 +362,11 @@ void OnFrame(const uint8_t* rgba, uint32_t stride, uint32_t cw, uint32_t ch, uin
     g_lastCopy = now;
 }
 
+bool WantsFrame() {
+    if (!g_active.load(std::memory_order_relaxed) || !Demand()) return false;
+    return NowMs() - g_lastCopy.load() >= (int64_t)(1000 / std::max<uint32_t>(1, g_opt.fps));
+}
+
 uint16_t Buttons() {
     if (!g_opt.input) return 0;
     if (NowMs() - g_buttonStamp.load() > kKeyTimeoutMs) return 0;

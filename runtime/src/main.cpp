@@ -25,7 +25,8 @@
 #include "kernel/xboxkrnl_sync.h"
 
 namespace rt::gpu { int Pm4SelfTest(); extern bool g_fbSlowPath, g_fbVerify; }
-namespace rt::gpu::d3d { extern bool g_texSlowPath, g_texVerify, g_resolveSlowPath, g_resolveVerify, g_texMemoOff, g_resolveSync, g_noResolveShortcut, g_resolveNoDse, g_verifyShortcut; extern unsigned g_rowThreads, g_kickDraws, g_kickResolveDraws; extern bool g_windowNoActivate; extern bool g_asyncResolveWriter; }
+namespace rt::gpu::d3d { extern uint32_t g_dumpEveryMs, g_dumpFromS, g_dumpForS; }
+namespace rt::gpu::d3d { extern bool g_texSlowPath, g_texVerify, g_resolveSlowPath, g_resolveVerify, g_texMemoOff, g_resolveSync, g_noResolveShortcut, g_resolveNoDse, g_verifyShortcut, g_depthResolveSync, g_depthResolveVerify, g_gpuTiming, g_resolveStaging, g_diagNoReadback, g_depthResolveCs, g_lazyReadback, g_strictResolveSync, g_presentVerify, g_orderedWrites, g_eagerIssue, g_swapMarks; extern unsigned g_rowThreads, g_kickDraws, g_kickResolveDraws, g_diagSyncMask; extern bool g_windowNoActivate; extern bool g_asyncResolveWriter; }
 namespace rt::gpu::d3d { void SetDumpHlslHash(uint64_t hash); }
 int RunCpuSelfTest(uint64_t n, uint64_t seed);   // selftest\cpu_selftest.cpp
 namespace rt { extern bool g_binkProbeOn; extern bool g_importSerialize; extern bool g_noAudio; void AudioSummary(); void BinkProbeReport(); }
@@ -276,9 +277,14 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--frames-dir") && i + 1 < argc) rt::gpu::Cfg().framesDir = argv[++i];
         else if (!std::strcmp(argv[i], "--shader-scan")) rt::gpu::Cfg().shaderScan = true;
         else if (!std::strcmp(argv[i], "--window-noactivate")) rt::gpu::d3d::g_windowNoActivate = true;
-        else if (!std::strcmp(argv[i], "--dump-fb")) rt::gpu::Cfg().dumpFb = true;
+        else if (!std::strcmp(argv[i], "--dump-fb")) { rt::gpu::Cfg().dumpFb = true; rt::gpu::d3d::g_strictResolveSync = true; }   // M60: el volcado lee la memoria guest en XE_SWAP
         else if (!std::strcmp(argv[i], "--no-d3d")) rt::gpu::Cfg().noD3d = true;
         else if (!std::strcmp(argv[i], "--no-audio")) rt::g_noAudio = true;
+        else if (!std::strcmp(argv[i], "--swap-interval") && i + 1 < argc) rt::gpu::Cfg().swapInterval = (uint32_t)std::strtoul(argv[++i], nullptr, 0) & 15;
+        else if (!std::strcmp(argv[i], "--log-time")) rt::g_importLogTime = true;
+        else if (!std::strcmp(argv[i], "--legacy-sleep")) { rt::g_legacySleep = true; rt::gpu::Cfg().legacyVsync = true; }
+        else if (!std::strcmp(argv[i], "--trace-swap-interval")) rt::gpu::Cfg().traceSwap = true;
+        else if (!std::strcmp(argv[i], "--vblank-hz") && i + 1 < argc) rt::gpu::Cfg().vblankHz = (uint32_t)std::strtoul(argv[++i], nullptr, 0);
         else if (!std::strcmp(argv[i], "--bink-trace")) { rt::gpu::Cfg().binkTrace = true; rt::g_binkProbeOn = true; }
         else if (!std::strcmp(argv[i], "--headless")) rt::gpu::Cfg().headless = true;
         else if (rt::viewer::ParseArg(argc, argv, i)) {}   // visor en vivo (PLAN_VIEW.md)
@@ -286,6 +292,23 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--tex-verify")) rt::gpu::d3d::g_texVerify = true;
         else if (!std::strcmp(argv[i], "--resolve-slow-path")) rt::gpu::d3d::g_resolveSlowPath = true;
         else if (!std::strcmp(argv[i], "--resolve-verify")) rt::gpu::d3d::g_resolveVerify = true;
+        else if (!std::strcmp(argv[i], "--depth-resolve-sync")) rt::gpu::d3d::g_depthResolveSync = true;
+        else if (!std::strcmp(argv[i], "--depth-resolve-verify")) rt::gpu::d3d::g_depthResolveVerify = true;
+        else if (!std::strcmp(argv[i], "--gpu-timing")) { rt::gpu::d3d::g_gpuTiming = true; rt::g_m60Diag = true; }
+        else if (!std::strcmp(argv[i], "--resolve-staging")) rt::gpu::d3d::g_resolveStaging = true;
+        else if (!std::strcmp(argv[i], "--no-resolve-staging")) rt::gpu::d3d::g_resolveStaging = false;
+        else if (!std::strcmp(argv[i], "--no-ordered-writes")) rt::gpu::d3d::g_orderedWrites = false;
+        else if (!std::strcmp(argv[i], "--no-eager-issue")) rt::gpu::d3d::g_eagerIssue = false;
+        else if (!std::strcmp(argv[i], "--swap-marks")) rt::gpu::d3d::g_swapMarks = true;
+        else if (!std::strcmp(argv[i], "--diag-no-readback")) rt::gpu::d3d::g_diagNoReadback = true;
+        else if (!std::strcmp(argv[i], "--depth-resolve-copy")) rt::gpu::d3d::g_depthResolveCs = false;
+        else if (!std::strcmp(argv[i], "--eager-readback")) rt::gpu::d3d::g_lazyReadback = false;
+        else if (!std::strcmp(argv[i], "--strict-resolve-sync")) rt::gpu::d3d::g_strictResolveSync = true;
+        else if (!std::strcmp(argv[i], "--present-verify")) rt::gpu::d3d::g_presentVerify = true;
+        else if (!std::strcmp(argv[i], "--dump-every-ms") && i + 1 < argc) rt::gpu::d3d::g_dumpEveryMs = (uint32_t)std::strtoul(argv[++i], nullptr, 0);
+        else if (!std::strcmp(argv[i], "--dump-from-s") && i + 1 < argc) rt::gpu::d3d::g_dumpFromS = (uint32_t)std::strtoul(argv[++i], nullptr, 0);
+        else if (!std::strcmp(argv[i], "--dump-for-s") && i + 1 < argc) rt::gpu::d3d::g_dumpForS = (uint32_t)std::strtoul(argv[++i], nullptr, 0);
+        else if (!std::strcmp(argv[i], "--diag-skip-sync") && i + 1 < argc) rt::gpu::d3d::g_diagSyncMask = (unsigned)std::strtoul(argv[++i], nullptr, 0);
         else if (!std::strcmp(argv[i], "--no-tex-memo")) rt::gpu::d3d::g_texMemoOff = true;
         else if (!std::strcmp(argv[i], "--resolve-sync")) rt::gpu::d3d::g_resolveSync = true;
         else if (!std::strcmp(argv[i], "--fb-slow-path")) rt::gpu::g_fbSlowPath = true;
@@ -298,6 +321,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--no-resolve-dse")) rt::gpu::d3d::g_resolveNoDse = true;
         else if (!std::strcmp(argv[i], "--gpu-row-threads") && i + 1 < argc) rt::gpu::d3d::g_rowThreads = (unsigned)std::strtoul(argv[++i], nullptr, 0);
         else if (!std::strcmp(argv[i], "--perf-nosample")) rt::perf::g_sample = false;
+        else if (!std::strcmp(argv[i], "--tiron-ms") && i + 1 < argc) rt::perf::g_tironMs = (uint32_t)std::strtoul(argv[++i], nullptr, 0);
         else if (!std::strcmp(argv[i], "--import-serialize")) rt::g_importSerialize = true;
         else if (!std::strcmp(argv[i], "--perf")) perfOut = (i + 1 < argc && argv[i + 1][0] != '-') ? argv[++i] : "perf_report.txt";
         else if (!std::strcmp(argv[i], "--warp")) rt::gpu::Cfg().warp = true;

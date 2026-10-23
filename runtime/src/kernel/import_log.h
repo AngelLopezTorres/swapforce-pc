@@ -8,6 +8,10 @@
 
 namespace rt {
 
+extern bool g_importLogTime;   // M60: --log-time
+extern bool g_m60Diag;         // M60: diagnosticos de tiempo del kernel (--gpu-timing)
+extern bool g_legacySleep;     // M60: --legacy-sleep (xboxkrnl_sync.cpp)
+
 // NTSTATUS usados por el runtime.
 constexpr uint32_t ST_SUCCESS = 0;
 constexpr uint32_t ST_PENDING = 0x103;

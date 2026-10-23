@@ -4,7 +4,10 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <map>
 #include <mutex>
+#include <string>
+#include <tuple>
 #include <vector>
 
 #include "guest_abi.h"
@@ -59,12 +62,38 @@ uint32_t TraceHandleForObject(const std::shared_ptr<KObject>& o) {
 }
 
 // Marca RAII de espera del hilo guest actual (volcado de hilos, M0).
+// M60 diagnostico (--gpu-timing): tiempo de espera por hilo guest y tipo (1 Nt, 2 Ke, 3 multiple, 4 seccion critica), por segundo.
+void M60WaitStat(uint32_t kind, double ms) {
+    static std::mutex mu; static std::map<std::pair<uint32_t, uint32_t>, std::tuple<uint64_t, double, uint64_t, double>> st;
+    static LARGE_INTEGER f{}, last{};
+    std::lock_guard<std::mutex> g(mu);
+    if (!f.QuadPart) { QueryPerformanceFrequency(&f); QueryPerformanceCounter(&last); }
+    uint32_t id = GuestThread::Current() ? GuestThread::Current()->id : 0;
+    auto& e = st[{id, kind}]; ++std::get<0>(e); std::get<1>(e) += ms; if (ms > 10.0) ++std::get<2>(e); std::get<3>(e) = std::max(std::get<3>(e), ms);
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    if (now.QuadPart - last.QuadPart > f.QuadPart) {
+        std::string s = "M60 esperas guest (hilo/tipo: n, ms, >10ms, max):";
+        char b[96];
+        for (auto& kv : st) if (std::get<1>(kv.second) > 5.0) {
+            std::snprintf(b, sizeof(b), " g%u/%u=(%llu, %.1f, %llu, %.1f)", kv.first.first, kv.first.second, (unsigned long long)std::get<0>(kv.second), std::get<1>(kv.second),
+                          (unsigned long long)std::get<2>(kv.second), std::get<3>(kv.second));
+            s += b;
+        }
+        ImportLog::Get().Printf("%s", s.c_str());
+        st.clear(); last = now;
+    }
+}
 struct WaitMark {
     GuestThread* t;
-    WaitMark(uint32_t kind, uint32_t h, uint32_t type, uint32_t n) : t(GuestThread::Current()) {
-        if (t) { t->waitHandle = h; t->waitType = type; t->waitCount = n; t->waitKind = kind; }
+    uint32_t kind; LARGE_INTEGER t0{};
+    WaitMark(uint32_t k, uint32_t h, uint32_t type, uint32_t n) : t(GuestThread::Current()), kind(k) {
+        if (t) { t->waitHandle = h; t->waitType = type; t->waitCount = n; t->waitKind = k; }
+        if (g_m60Diag) QueryPerformanceCounter(&t0);
     }
-    ~WaitMark() { if (t) { t->waitKind = 0; } }
+    ~WaitMark() {
+        if (t) { t->waitKind = 0; }
+        if (g_m60Diag) { LARGE_INTEGER f, t1; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t1); M60WaitStat(kind, (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart); }
+    }
 };
 
 constexpr uint32_t ST_TIMEOUT = 0x102;
@@ -294,12 +323,47 @@ GUEST_IMPORT_IMPL(KeWaitForMultipleObjects) {
     SetRet(ctx, WaitMany(objs, all, TimeoutMs(base, Arg32(ctx, base, 6))));
 }
 
+// M60: espera relativa con la resolucion pedida (100 ns) mediante un temporizador de alta resolucion por hilo
+// (Microsoft Learn: CreateWaitableTimerExW, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION). Antes: Sleep(ms) con redondeo hacia arriba
+// a 1 ms y granularidad del planificador (medido: 1 ms pedido -> 1,83 ms reales de media en el hilo g20).
+bool rt::g_legacySleep = false;   // M60: --legacy-sleep restaura Sleep(ms)
+static bool PreciseDelay(int64_t rel100ns) {
+    if (rt::g_legacySleep || rel100ns <= 0 || rel100ns > 10000000) return false;   // hasta 1 s
+    thread_local HANDLE tm = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (!tm) return false;
+    LARGE_INTEGER due; due.QuadPart = -rel100ns;
+    if (!SetWaitableTimer(tm, &due, 0, nullptr, nullptr, FALSE)) return false;
+    WaitForSingleObject(tm, INFINITE);
+    return true;
+}
+
 GUEST_IMPORT_IMPL(KeDelayExecutionThread) {
     ImportScope sc("KeDelayExecutionThread", ctx, base);
     // (WaitMode, Alertable, Interval*)
     DWORD ms = TimeoutMs(base, ctx.r5.u32);
     if (ms > 2000) ImportLog::Get().Printf("  KeDelayExecutionThread tid=%u lr=%08X intervalo=%016llX (%u ms)", GuestThread::Current() ? GuestThread::Current()->id : 0, (uint32_t)ctx.lr, (unsigned long long)G64(base, ctx.r5.u32), (unsigned)ms);
-    Sleep(ms == INFINITE ? 0xFFFFFFF : ms);
+    const int64_t rawIv = ctx.r5.u32 ? (int64_t)G64(base, ctx.r5.u32) : 0;
+    if (g_m60Diag) {   // M60 diagnostico: duracion pedida (100 ns del guest) frente a la real, por hilo y por segundo
+        LARGE_INTEGER f, t0, t1; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
+        if (!(rawIv < 0 && PreciseDelay(-rawIv))) Sleep(ms == INFINITE ? 0xFFFFFFF : ms);
+        QueryPerformanceCounter(&t1);
+        int64_t v = ctx.r5.u32 ? (int64_t)G64(base, ctx.r5.u32) : 0;
+        double req = v < 0 ? (double)(-v) / 10000.0 : 0.0, act = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart;
+        static std::mutex mu; static std::map<uint32_t, std::tuple<uint64_t, double, double, double>> st; static int64_t last = 0;
+        std::lock_guard<std::mutex> g(mu);
+        uint32_t id = GuestThread::Current() ? GuestThread::Current()->id : 0;
+        auto& e = st[id]; ++std::get<0>(e); std::get<1>(e) += req; std::get<2>(e) += act; std::get<3>(e) = std::max(std::get<3>(e), act);
+        if (t1.QuadPart - last > f.QuadPart) {
+            std::string s = "M60 KeDelayExecutionThread por hilo (n, pedido_ms, real_ms, max_ms):";
+            char b[96];
+            for (auto& kv : st) { std::snprintf(b, sizeof(b), " g%u=(%llu, %.1f, %.1f, %.1f)", kv.first, (unsigned long long)std::get<0>(kv.second), std::get<1>(kv.second), std::get<2>(kv.second), std::get<3>(kv.second)); s += b; }
+            ImportLog::Get().Printf("%s", s.c_str());
+            st.clear(); last = t1.QuadPart;
+        }
+        SetRet(ctx, ST_SUCCESS);
+        return;
+    }
+    if (!(rawIv < 0 && PreciseDelay(-rawIv))) Sleep(ms == INFINITE ? 0xFFFFFFF : ms);
     SetRet(ctx, ST_SUCCESS);
 }
 

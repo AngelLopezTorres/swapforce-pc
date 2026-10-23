@@ -303,6 +303,15 @@ HostTexture* D3D12Backend::GetTexture(uint32_t idx, bool vertexStage) {
         maxOff = std::max<int64_t>(maxOff, xe::gpu::texture_address::Tiled2D((int32_t)wBlocks - 1, (int32_t)hBlocks - 1, pitchAligned, bpbLog2));
         needBytes = (uint64_t)maxOff + fi.bpb + (layers > 1 ? faceBytes * (layers - 1) : 0);
     }
+    if (g_gpuTiming && fmtId == 23) {   // M60 diagnostico
+        static int n23 = 0;
+        if (n23 < 10) {
+            ++n23; int ent = 0, val = 0;
+            for (auto& kv : resolvedTex) if (kv.second.destBase == baseAddr && !kv.second.derived) { ++ent; val += kv.second.valid; }
+            ImportLog::Get().Printf("M60 tex23 base=%08X %ux%u dim=%u tiled=%d endian=%u pitch=%u srgb=%d entradas=%d validas=%d", baseAddr, width, height, dimension, (int)tiled, endian, pitchAligned,
+                                    (int)((uint32_t)tf.sign_x == 3 && fi.dxgi != fi.srgb), ent, val);
+        }
+    }
     // M8: lectura de un resolve del mismo fotograma con coincidencia exacta -> copia GPU del RT (sin memoria guest)
     if (dimension == 1 && layers == 1 && depth == 1 && tiled && !((uint32_t)tf.sign_x == 3 && fi.dxgi != fi.srgb))
         if (!shortcutVerifyActive)
@@ -316,7 +325,9 @@ HostTexture* D3D12Backend::GetTexture(uint32_t idx, bool vertexStage) {
                 return rtx;
             }
     // si la memoria a leer tiene resolves pendientes de escribir, se completan antes (exactitud)
-    FlushResolvesIfOverlap(baseAddr, (uint32_t)std::min<uint64_t>((uint64_t)baseAddr + needBytes, 0x20000000ull));
+    rt::gpu::g_syncReason = 10;
+    if (FlushResolvesIfOverlap(baseAddr, (uint32_t)std::min<uint64_t>((uint64_t)baseAddr + needBytes, 0x20000000ull)) && g_gpuTiming)
+        ++tsTexFlush[((uint64_t)baseAddr << 32) | ((uint64_t)fmtId << 26) | ((uint64_t)(width & 0x1FFF) << 13) | (height & 0x1FFF)];   // M60
     const uint8_t* mem = PhysHost(baseAddr, (uint32_t)needBytes);
     ++fTexCalls;
     if (SeqLog()) ImportLog::Get().Printf("M8SEQ draw=%llu TEX fetch=%u base=%08X bytes=%llu %ux%u fmt=%s tiled=%u endian=%u", (unsigned long long)drawSerial, idx, baseAddr, (unsigned long long)needBytes, width, height, TexFmtName(fmtId), (unsigned)tiled, endian);
@@ -462,6 +473,7 @@ HostTexture* D3D12Backend::GetTexture(uint32_t idx, bool vertexStage) {
         src.PlacedFootprint.Footprint = {dfmt, (width + bw - 1) / bw * bw, (height + bh - 1) / bh * bh, 1, rowPitch};
         cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     }
+    TsMark(5, 0);   // M60
     Transition(ht.res.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     ht.dataHash = dataHash; ht.lastUse = ++texSerial;
     if (SeqLog()) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); ImportLog::Get().Printf("M8SEQ UPLOAD fetch=%u base=%08X %ux%u fmt=%s expand=%d bytes=%zu us=%.0f", idx, baseAddr, width, height, TexFmtName(fmtId), fi.expand, lin.size(), (perf::Now() - m8t0) * 1e6 / f.QuadPart); }

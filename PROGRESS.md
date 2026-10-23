@@ -497,3 +497,115 @@ Observaciones: (a) la presentación del juego tras t≈25 s varía entre ejecuci
 
 ### HANDOFF (propietario de `runtime\src\kernel\xam_input.cpp`, Codex)
 Cambio mínimo en `xam_input.cpp`: una línea `#include "viewer/viewer.h"` y, en `XamInputGetState`, `DWORD rc=ReadState(user,s); if (!rc && user==0) s.pad.buttons |= rt::viewer::Buttons();` (OR con la entrada local; `Buttons()` devuelve 0 sin `--viewer-input` o con latido caducado). No se modificó nada más de ese fichero. `XamInputGetCapabilities` no combina el visor (no se consideró necesario).
+
+## 60 FPS (PLAN_60FPS.md; ejecutado 2026-10-23 en `runtime\build_60fps`, solo `--headless`)
+**Resultado: criterio de aceptación NO cumplido.** Ninguna escena alcanza ≥58 VdSwap/s. Sin decisión de fidelidad (ver Hito 3). Sin cambio de comportamiento por defecto.
+
+### Compilación y ejecución
+- Compila: `runtime\build_60fps\out\SwapForceRT.exe` (clang-cl, Ninja, Release, `-DSWAPFORCE_OUT_DIR`; script fuera del repositorio). Ejecuciones: `runtime\build_60fps\runs\<etiqueta>\` (`--userdata-dir` y `--log` propios). No se han tocado `runtime\build_live*`, `ppc_gen`, `recomp` ni `tools\XenonRecomp`. Proceso del usuario (PID 41960, `build_live2`) intacto; ningún `SwapForceRT` propio vivo al cierre.
+
+### Hito 1: qué fija el intervalo (evidencia)
+- `VdSwap` (`kernel\xboxkrnl_video.cpp:121`) no recibe intervalo: solo escribe 64 palabras PM4 y `XE_SWAP`.
+- Cola de volteo del juego (`ppc_gen\ppc_recomp.442.cpp`): `sub_82F5C258` (envío) escribe la entrada `{A=r30, B=vencimiento}` en `dev+16980+8*slot` (slot = `wr & 0xF`) y luego `wr` (`dev+17112`). El vencimiento usa `r29 = (r30 >> 24) & 0xF`, es decir, un argumento que pasa el llamador. `sub_82F5C128` (manejador VBLANK) voltea cuando `vencimiento <= dev+16952` e incrementa `dev+16976`. `sub_82F5CB30` espera a `[dev+16968] - [dev+16976] < 1`.
+- Medido (`--trace-swap-interval`, `dev` = userData del callback VBLANK = `g_cbData`, ej. 0x40003980): en cada envío el vencimiento es `vblancos_actuales + 2` (p. ej. VB n=152: `gst(16952)=130`, `last_due=132`; VB n=154: `134`). Por tanto el juego codifica intervalo 2 y el manejador lo respeta. Caso (A) de PLAN_60FPS: el juego escribe 2.
+- No identificado: el llamador de `sub_82F5C258` (se invoca indirectamente, sin `bl` en `ppc_gen`) [NV].
+
+### Hito 2: capacidad (60 s salvo nota; `--log-time`, `--perf-nosample`)
+| Ejecución | Parámetro | VdSwap totales | Media aprox. (incl. arranque) |
+|---|---|---|---|
+| base60 | 60 Hz vblank (defecto) | 1291 | 21,4/s |
+| vb120 | `--vblank-hz 120` | 2003 | 33,3/s |
+| si1 | `--swap-interval 1` (NO FIEL) | 1333 | 22,1/s |
+| vb1000 (40 s) | `--vblank-hz 1000` | 3947 | ~109/s en t=2,75-38,58 s (3895 swaps / 35,8 s) |
+- Con pacing casi nulo el runtime produce >100 swaps/s en la ventana de vídeos: el límite no es la CPU del runtime en esa fase.
+- Pero 120 Hz (2 vblancos = 16,7 ms) da 33/s y la emulación de intervalo 1 da 22/s: **la relación no es lineal con el número de vblancos**. Causa [NV]; probablemente interacción con la espera del juego (`sub_82F5CB30`) y con la lógica de Bink (`BinkWait`). No medido con más profundidad.
+- Medido en `runtime\build_60fps\runs`: los 60 Hz dan 60 vblancos/s (`vblank=3600` en 60 s).
+
+### Hito 3: experimento de fidelidad
+- Medido: intervalo entre aperturas de `gsbp_atvi.bik` y `gsbp_vvisions.bk2` (`NtCreateFile`, reloj QPC): base60 10,437 s; vb120 10,393 s; si1 10,432 s (diferencias < 0,5 %). Caveat: incluye cargas de .pak entre ambas aperturas; no es duración pura del vídeo. Con 3 de 3 configuraciones no cambió, lo que sugiere reproducción por reloj (`KeTimeStampBundle`), pero no es prueba concluyente [NV].
+- **No medido**: duración de animaciones del título y del menú (no se capturó un evento visual de referencia en PNG; no se llegó al menú en las ejecuciones de 60 s).
+- Regla de decisión: no aplicable de forma concluyente. La prueba de «intervalo a 1 vblanco» no cambió la tasa de volteo (22/s), por lo que no discrimina si el contenido se aceleraría al alcanzar 60/s. Repetir tras reducir el coste por fotograma.
+- **Decisión no tomada**: pregunta abierta al usuario entre (A) lógica a 60 Hz (acelera ×2 si la lógica es por fotograma) y (B) presentación a 60 Hz con repetición de fotogramas. Por defecto no se cambia el comportamiento.
+
+### Hito 4: optimizaciones
+- No ejecutado: el Hito 2 da <60 con pacing de 2 vblancos y el aislamiento de la causa de 33/s (vb120) y 22/s (si1) no está cerrado. Pendiente (Hito 4 del plan: CP por trampa, caché de PSO, reducción de draws).
+
+### Hito 5: aceptación
+- 0 de 3 ejecuciones con ≥58 VdSwap/s en ninguna escena. Imagen no verificada en esta sesión (no se volcaron PNG de título/menú).
+
+### Cambios de código (todos opt-in salvo el registro de marcas, sin efecto por defecto)
+- `runtime\src\gpu\gpu.h`: `Config::traceSwap` (`--trace-swap-interval`), `Config::vblankHz` (`--vblank-hz N`, defecto 60), `Config::swapInterval1` (`--swap-interval 1`, NO FIEL).
+- `runtime\src\gpu\gpu.cpp`: `TraceSwapState` (diagnóstico de solo lectura en VB y SWAP), `AdjustDueForInterval1` (resta 1 al vencimiento de cada entrada nueva de la cola; escribe en memoria guest), `VsyncMain` usa `vblankHz`.
+- `runtime\src\kernel\import_log.{h,cpp}`: `--log-time` (prefijo de marca de tiempo en ms; sin efecto si no se activa).
+- `runtime\src\main.cpp`: registro de las cuatro opciones.
+- Verificación: compila (`build_60fps\build*.log`). El ejecutable por defecto no se ha vuelto a medir tras los cambios finales [NV].
+
+### Problemas abiertos
+1. Causa de que 120 Hz (33/s) y la emulación de intervalo 1 (22/s) no escalen linealmente, frente a >100/s con 1000 Hz.
+2. Llamador de `sub_82F5C258` (indirecto).
+3. Medición de animaciones del título y del menú (Hito 3) y de dificultad (pantalla negra de carga de `TA_VolcanoIntro`, [NV] si es I/O).
+4. Decisión del usuario sobre (A) o (B) (Hito 6 del plan).
+
+### Ronda 2 (2026-10-23, agente Opus; mismo worktree y `runtime\build_60fps`; añadido, no sustituye lo anterior)
+**Resultado: 60 VdSwap/s en todas las escenas hasta la dificultad, con imagen verificada y sin aceleración medida de la lógica.** Criterio ≥58 VdSwap/s cada segundo: ver tabla (3 ejecuciones). Cambio de comportamiento por defecto: intervalo de presentación 1 (antes, el del juego: 2).
+
+#### Revisión del trabajo anterior (Haiku)
+- `--swap-interval 1` anterior (`AdjustDueForInterval1`) era ineficaz: restaba 1 al vencimiento de la entrada de la cola, pero el siguiente vencimiento se calcula como `ultimo_vencimiento (dev+16960) + intervalo`, que no se modificaba; la cadencia seguía en 2 vblancos (medido: 22/s, igual que sin opción). Eliminado.
+- Fórmula del intervalo: `sub_82F5C258` hace `rlwinm r29,r30,24,28,31` = `(r3 >> 8) & 0xF` (no `>> 24`). El argumento es `frontbuffer | intervalo<<8 | umbral` (ej. `0C70D200`: frontbuffer 0C70D000, intervalo 2, umbral 0). Lo escribe el D3D del juego en `[blk+20]` (`blk = [dev+11028]`) y lo lee el manejador de interrupción del CP (`sub_82F58198`, fuente 1) al llamar a `[blk+16] = sub_82F5C258`.
+- «La tasa no escala linealmente» era un artefacto de medir medias de 60 s: por segundo, `--vblank-hz 120` daba 57-60 swaps/s en los vídeos; la escena posterior (título) estaba limitada a ~20/s por el coste del backend con cualquier frecuencia de vblank (1000 Hz: 26/s).
+
+#### Causa del límite (evidencia)
+1. Intervalo 2 pedido por el juego → tope de 30 con vblank a 60 Hz (ya documentado).
+2. Título/menú a ~20/s (aunque el vblank no limite): resolve de profundidad síncrono de la ronda 7 (Codex): ~5 por fotograma, cada uno con `FlushAndWait` y copia del plano completo del RT de profundidad (18 MB por resolve: RT de 1040x~4350) a memoria de lectura y conversión float→20e4 en la CPU (`--gpu-timing`: 2,7 GB/s de lectura solo de profundidad).
+3. Tras corregir 2, volumen de lectura GPU→CPU de los resolves de color (4,7 GB/s; ~60 MB/fotograma) y esperas del CP en los puntos de sincronización (XE_SWAP, fin de lote, EVENT_WRITE_SHD, COHER) a que la GPU y el hilo escritor terminen.
+4. Coste de CPU del CP por draw: `Note()` construía `std::string` y buscaba en `std::map` en cada draw (p. ej. «SIMPLIFY profundidad D24FS8...»); heap de descriptores de 1024 draws que forzaba `FlushAndWait` cada ~1,7 fotogramas.
+5. Jitter del VBLANK (`Sleep(1)`: intervalos 15,2-18,0 ms) y `KeDelayExecutionThread` redondeado a ms (1 ms pedido → 1,83 ms reales en el hilo g20).
+
+#### Cambios (todo en `runtime\src\gpu\**` salvo lo indicado; opción para volver al comportamiento anterior entre paréntesis)
+| # | Cambio | Verificación de exactitud |
+|---|---|---|
+| 1 | Intervalo de presentación: el CP sustituye los bits 8-11 del argumento de volteo antes de la interrupción (`gpu.cpp`, `DispatchInterrupt`, fuente 1, solo si `[blk+16] == 82F5C258`). Defecto 1 (`--swap-interval 0` = el del juego, 30 fps) | Experimento de fidelidad (abajo) |
+| 2 | Resolve de profundidad diferido por sombreador de cálculo: solo la región, conversión float32→20e4<<8 en la GPU (aritmética entera de `Float32To20e4` de Xenia), escritura en el hilo escritor; salida adicional R32_FLOAT = `Float20e4To32` como atajo GPU para la textura k_24_8_FLOAT del mismo fotograma (`--depth-resolve-copy`, `--depth-resolve-sync`) | `--depth-resolve-verify`: 2200 resolves, 0 distintos; `--verify-shortcut`: 43 800 usos, 0 distintos |
+| 3 | Copia de resolves RT → búfer en VRAM → memoria de lectura (`--no-resolve-staging`); a la memoria de lectura solo resolves vivos (los cubiertos por otro posterior no se leen) con emisión anticipada en cada envío de lista, salvo los que el fotograma anterior predice cubiertos (`--eager-readback`, `--no-eager-issue`) | `--resolve-verify`: 23 000, 0 distintos |
+| 4 | Política de sincronización: XE_SWAP, INTERRUPT, fin de lote y WAIT_REG_MEM sobre memoria sin solape no esperan a los resolves; EVENT_WRITE_SHD/EXT, MEM_WRITE, REG_TO_MEM y COND_WRITE se encolan detrás de los resolves pendientes (escritura de fin de canalización, `pm4.cpp` `WriteOrdered`); WAIT_REG_MEM sobre registro (COHER_STATUS_HOST) sigue vaciando (`--strict-resolve-sync`, `--no-ordered-writes`) | Omitir también el vaciado de COHER provocó DXGI_ERROR_DEVICE_HUNG (ejecuciones c13 y c16): se mantiene |
+| 5 | Presentación desde la copia GPU del resolve del frontbuffer (CS `Load` → `frameRT` como UAV); el visor recibe la imagen por lectura asíncrona un fotograma después | `--present-verify` (frente a `DecodeFrontbuffer` tras escribir los resolves): 1600 fotogramas (vídeos, título, menú, dificultad), 0 píxeles distintos |
+| 6 | `Note()` para literales sin `std::string` (recuentos fundidos al cerrar); heap de descriptores x8 en 4 segmentos rotatorios con valla por segmento (antes `FlushAndWait` al llenarse, cada ~1,7 fotogramas) | Mismos textos de nota |
+| 7 | VBLANK con temporizador de alta resolución (intervalos 16,2-17,2 ms; antes 15,2-18,0); `KeDelayExecutionThread` con la duración pedida en 100 ns (`kernel\xboxkrnl_sync.cpp`, compartido) (`--legacy-sleep`) | — |
+| 8 | Diagnóstico opcional: `--gpu-timing` (marcas de tiempo de la GPU por operación, vaciados por causa, eventos de volteo tardío, esperas guest), `--tiron-ms`, `--dump-every-ms`/`--dump-from-s`/`--dump-for-s`; `--diag-no-readback`, `--diag-skip-sync` (NO FIELES, solo medida) | — |
+
+Eliminado: `AdjustDueForInterval1`. Se conservan `--trace-swap-interval`, `--vblank-hz` y `--log-time` del agente anterior.
+
+#### Experimento de fidelidad (intervalo 2 = 30 fps frente a intervalo 1 = 60 fps; mismo binario)
+- Bink 1 (apertura de atvi.bik → apertura de vvisions.bk2): 10,477 s (b1, 30 fps) y 10,394 s (i1, 60 fps): −0,8 % (incluye cargas).
+- Título, desvanecimiento del destello (luminancia media de la región 700-860 x 40-140 en PNG volcados): 6,87 unidades/s a 30 fps (b3) y 7,00/s a 60 fps (i3). Con lógica por fotograma el cociente esperado sería ~1,7 (23 frente a 40 fps efectivos con volcados); medido 1,02. Valor final idéntico (179,27).
+- Menú principal, periodo del movimiento del ave (región 600-1000 x 300-600, volcado por reloj cada 50 ms durante 8 s, autocorrelación): 0,50 s (fm30) y 0,48 s (fm60). Con lógica por fotograma sería 0,25 s.
+- Conclusión con estos datos: en las escenas medidas la lógica avanza por tiempo real; a 60 fps se muestran más fotogramas distintos sin acelerar. Dificultad: sin animación medible en la ventana usada (amplitud < 0,2) [NV]. Juego posterior a la dificultad: no medido [NV].
+
+#### Medida por escena (`--headless`; visor con navegación automática: Enter x10, izquierda+Z, Z; VdSwap/s por segundo a partir de las líneas FRAME con `--log-time`)
+Scripts fuera del repositorio (scratchpad): `nav.sh <etiqueta> <puerto 8771-8779>` lanza `out\SwapForceRT.exe --headless --log-time --timeout 200 --viewer P --viewer-input` y pulsa teclas por curl; `scenes.py` calcula media, mínimo y racha. Bink 1 y Bink 2 duran ~8 y ~7 segundos completos (menos de 30 s).
+| Escena | Antes (`out_base` = HEAD sin cambios, base2) media/mín | acc4 | acc5 | acc6 | Racha ≥58 acc4/5/6 |
+|---|---|---|---|---|---|
+| Bink 1 | 30,0 / 30 | 59,75 / 59 | 60,00 / 60 | 60,00 / 60 | 8/8/8 s (vídeo completo) |
+| Bink 2 | 29,1 / 24 | 60,00 / 60 | 60,00 / 60 | 59,86 / 59 | 7/7/7 s (vídeo completo) |
+| Título | 29,6 / 27 | 59,78 / 58 | 59,92 / 58 | 59,89 / 57 | 36/36/35 s |
+| Menú principal | 29,7 / 27 | 59,57 / 57 | 59,83 / 58 | 59,34 / 57 | 17/35/15 s |
+| Dificultad | 29,6 / 28 | 59,86 / 58 | 59,83 / 59 | 59,66 / 58 | 35/35/35 s |
+
+Tanda anterior (acc1-3, ventana de menú más corta): título 34/34/34 s, dificultad 30/31/30 s, menú 20/26/30 s.
+**Aceptación (≥58 cada segundo durante ≥30 s, 3 ejecuciones): cumplida en título y dificultad (3/3) y en los vídeos durante toda su duración; menú principal 1/3 (segundos aislados a 57 por 1-3 volteos tardíos).** Capacidad sin ritmo (`--vblank-hz 1000`, título): ~83 fps (antes de esta ronda ~35 con la instancia del usuario activa).
+
+#### Imagen verificada
+PNG/JPEG abiertos: título (`b2`, `i2`), diálogo de perfil, menú principal y dificultad (`n1`, `acc3`, `dv8`), Bink 1 (logotipo Activision con los artefactos verde/azul ya documentados en M8), Bink 2 en volcados PNG de `bk_def` (17,9-23,9 s, contenido no negro). Las capturas `video2.jpg` de `n4` y `acc*` son negras por el visor (sirve el último JPEG si no hubo peticiones en 3 s: imagen de ~15,4 s, transición entre vídeos), no por el render; `nav.sh` corregido (doble petición). 0 `shader_fail`, 0 `pso_fail`, 0 `removed` en las ejecuciones de aceptación y verificación.
+
+#### Problemas abiertos
+1. Volteos tardíos residuales (~1 %): (a) segundos en que la GPU tarda ~35 % más en todas las categorías a la vez y el vaciado de COHER al inicio del fotograma espera a la GPU [NV causa: reloj/potencia de la GPU u otros procesos]; (b) paradas del lado del juego de 30-65 ms sin envío de órdenes (CP inactivo) [NV causa].
+2. Vaciado obligatorio en WAIT_REG_MEM de COHER_STATUS_HOST aunque el bit 31 esté a 0 (Xenia `MakeCoherent` no actúa en ese caso): omitirlo cuelga la GPU aquí; causa exacta [NV] (hipótesis: el juego reutiliza memoria tras esa espera y una escritura diferida tardía la sobrescribe).
+3. Ventana (`Present(1,0)` con vsync del monitor en el hilo del CP) no probada: puede bloquear el CP hasta un periodo de refresco por fotograma [NV]; requiere autorización para abrir ventana.
+4. Bloqueo observado una vez (v5): CP parado en el fotograma 1497 y el proceso no terminó con `--timeout` (lo cerró `timeout`); no reproducido en ~20 ejecuciones posteriores [NV causa].
+5. Caché de PSO en disco no implementada (tirón de ~1 s en la transición vídeo → título; `creacion_pso` 983 ms).
+6. La instancia del usuario (PID 41960, `build_live2`) terminó a las 15:03:55 por su propio `--timeout 3600` (sus ficheros dejaron de escribirse una hora después de la fecha de su exe, 14:03:54); no se tocó. Las medidas anteriores a esa hora (incluida la línea base de la ronda 1, título ~20/s) tenían su carga concurrente; la línea base limpia (base2) da ~30 en todas las escenas.
+
+#### Decisiones del usuario
+1. Mantener 60 fps por defecto (`--swap-interval 1`) o volver a 30 (`--swap-interval 0`).
+2. Aceptar la política de sincronización de resolves (cambio 4) o la estricta de M8 (`--strict-resolve-sync`).
+3. Autorizar la prueba con ventana (`--window-noactivate`).

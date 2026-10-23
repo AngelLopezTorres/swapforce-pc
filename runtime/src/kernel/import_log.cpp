@@ -87,15 +87,25 @@ uint64_t ImportLog::Unique() const {
     return u.size();
 }
 
+bool g_importLogTime = false;
+bool g_m60Diag = false;   // M60: diagnosticos de tiempo del kernel (--gpu-timing)   // M60: --log-time (prefijo de marca de tiempo en ms desde el primer registro)
+
 void ImportLog::Printf(const char* fmt, ...) {
     char buf[2048];
     va_list ap;
     va_start(ap, fmt);
     std::vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
+    char stamp[32] = "";
+    if (g_importLogTime) {
+        static LARGE_INTEGER freq{}, t0{};
+        if (!t0.QuadPart) { QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&t0); }
+        LARGE_INTEGER now; QueryPerformanceCounter(&now);
+        std::snprintf(stamp, sizeof(stamp), "[%.3f] ", (double)(now.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart);
+    }
     std::lock_guard<std::mutex> g(impl_->mu);
-    if (impl_->f) { std::fputs(buf, impl_->f); std::fputc('\n', impl_->f); std::fflush(impl_->f); }
-    std::fputs(buf, stdout); std::fputc('\n', stdout);
+    if (impl_->f) { std::fputs(stamp, impl_->f); std::fputs(buf, impl_->f); std::fputc('\n', impl_->f); std::fflush(impl_->f); }
+    std::fputs(stamp, stdout); std::fputs(buf, stdout); std::fputc('\n', stdout);
 }
 
 void ImportLog::Enter(const char* name, bool impl, const PPCContext& ctx, uint8_t*) {

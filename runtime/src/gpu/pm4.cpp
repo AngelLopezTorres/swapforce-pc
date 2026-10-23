@@ -8,6 +8,8 @@
 #include "perf.h"
 
 namespace rt::gpu {
+int g_syncReason = 0;   // M60: causa del punto de sincronizacion en curso (politica de vaciado de resolves y estadistica)
+uint32_t g_syncAddr = 0;   // M60: direccion de la espera WAIT_REG_MEM sobre memoria
 
 struct OpName { uint32_t op; const char* name; };
 static const OpName kOps[] = {
@@ -135,6 +137,7 @@ bool Pm4Parser::Type3(Reader& r, uint32_t pkt, int depth) {
             r.Skip(count); break;
         case PM4_INTERRUPT: {
             uint32_t mask = r.Read();
+            g_syncReason = 1;   // M60 diagnostico
             host_->SyncPoint();
             Line("INTERRUPT cpu_mask=0x%X", mask);
             host_->Interrupt(mask);
@@ -144,6 +147,7 @@ bool Pm4Parser::Type3(Reader& r, uint32_t pkt, int depth) {
             uint32_t magic = r.Read(), fb = r.Read(), w = r.Read(), h = r.Read();
             r.Skip(count - 4);
             Line("XE_SWAP magic=%08X fb=%08X %ux%u", magic, fb, w, h);
+            g_syncReason = 2;   // M60 diagnostico
             host_->SyncPoint();
             host_->Swap(fb, w, h);
             EndFrame();
@@ -162,6 +166,8 @@ bool Pm4Parser::Type3(Reader& r, uint32_t pkt, int depth) {
         case PM4_WAIT_REG_MEM: {
             uint32_t wi = r.Read(), addr = r.Read(), ref = r.Read(), mask = r.Read(), wait = r.Read();
             Line("WAIT_REG_MEM info=%X addr=%08X ref=%X mask=%X", wi, addr, ref, mask);
+            g_syncReason = (wi & 0x10) ? 15 : 3;   // M60: 15 = espera sobre memoria, 3 = sobre registro (p. ej. COHER_STATUS_HOST)
+            g_syncAddr = (wi & 0x10) ? (addr & 0x1FFFFFFC) : addr;
             host_->SyncPoint();
             ok = Wait(wi, addr, ref, mask, wait);
             break;
@@ -177,17 +183,19 @@ bool Pm4Parser::Type3(Reader& r, uint32_t pkt, int depth) {
         case PM4_REG_TO_MEM: {
             uint32_t reg = r.Read(), mem = r.Read();
             uint32_t v = GpuSwap32(host_->ReadReg(reg), mem & 3);
+            g_syncReason = 4;   // M60 diagnostico
             host_->SyncPoint();
-            if (uint8_t* p = host_->Phys(mem & ~3u, 4)) { std::memcpy(p, &v, 4); host_->MemWritten(mem & ~3u, 4); }
+            if (uint8_t* p = host_->Phys(mem & ~3u, 4)) { if (!host_->WriteOrdered(mem & ~3u, &v, 4)) std::memcpy(p, &v, 4); host_->MemWritten(mem & ~3u, 4); }
             break;
         }
         case PM4_MEM_WRITE: {
             uint32_t addr = r.Read();
+            g_syncReason = 5;   // M60 diagnostico
             host_->SyncPoint();
             if (count > 1) host_->MemWritten(addr & ~3u, (count - 1) * 4);
             for (uint32_t i = 0; i + 1 < count; ++i) {
                 uint32_t d = GpuSwap32(r.Read(), addr & 3);
-                if (uint8_t* p = host_->Phys(addr & ~3u, 4)) std::memcpy(p, &d, 4);
+                if (uint8_t* p = host_->Phys(addr & ~3u, 4)) { if (!host_->WriteOrdered(addr & ~3u, &d, 4)) std::memcpy(p, &d, 4); }
                 addr += 4;
             }
             break;
@@ -196,14 +204,16 @@ bool Pm4Parser::Type3(Reader& r, uint32_t pkt, int depth) {
             uint32_t wi = r.Read(), pa = r.Read(), ref = r.Read(), mask = r.Read(), wa = r.Read(), wd = r.Read();
             uint32_t value = 0;
             if (wi & 0x10) {
+                host_->ReadBarrier(pa & ~3u, 4);   // M60: escrituras ordenadas pendientes en esa direccion
                 uint32_t* p = reinterpret_cast<uint32_t*>(host_->Phys(pa & ~3u, 4));
                 if (p) value = GpuSwap32(*p, pa & 3);
             } else value = host_->ReadReg(pa);
             if (Compare(wi, value, mask, ref)) {
                 if (wi & 0x100) {
                     uint32_t d = GpuSwap32(wd, wa & 3);
+                    g_syncReason = 6;   // M60 diagnostico
                     host_->SyncPoint();
-                    if (uint8_t* p = host_->Phys(wa & ~3u, 4)) { std::memcpy(p, &d, 4); host_->MemWritten(wa & ~3u, 4); }
+                    if (uint8_t* p = host_->Phys(wa & ~3u, 4)) { if (!host_->WriteOrdered(wa & ~3u, &d, 4)) std::memcpy(p, &d, 4); host_->MemWritten(wa & ~3u, 4); }
                 } else host_->WriteReg(wa, wd);
             }
             break;
@@ -219,8 +229,9 @@ bool Pm4Parser::Type3(Reader& r, uint32_t pkt, int depth) {
             host_->WriteReg(REG_VGT_EVENT_INITIATOR, init & 0x3F);
             uint32_t d = ((init >> 31) & 1) ? (uint32_t)host_->Counter() : value;
             d = GpuSwap32(d, addr & 3);
+            g_syncReason = 7;   // M60 diagnostico
             host_->SyncPoint();
-            if (uint8_t* p = host_->Phys(addr & ~3u, 4)) { std::memcpy(p, &d, 4); host_->MemWritten(addr & ~3u, 4); }
+            if (uint8_t* p = host_->Phys(addr & ~3u, 4)) { if (!host_->WriteOrdered(addr & ~3u, &d, 4)) std::memcpy(p, &d, 4); host_->MemWritten(addr & ~3u, 4); }
             break;
         }
         case PM4_EVENT_WRITE_EXT: {
@@ -229,9 +240,12 @@ bool Pm4Parser::Type3(Reader& r, uint32_t pkt, int depth) {
             // Xenia: extents fijos {0, 8192>>3, 0, 8192>>3, 0, 1} en 16 bits con intercambio de bytes
             // (valor 8192 de kTexture2DCubeMaxWidthHeight: [NV]).
             static const uint16_t ext[6] = {0, 8192 >> 3, 0, 8192 >> 3, 0, 1};
+            g_syncReason = 8;   // M60 diagnostico
             host_->SyncPoint();
             if (uint8_t* p = host_->Phys(addr & ~3u, 12)) {
-                for (int i = 0; i < 6; ++i) { uint16_t v = __builtin_bswap16(ext[i]); std::memcpy(p + i * 2, &v, 2); }
+                uint8_t buf[12];
+                for (int i = 0; i < 6; ++i) { uint16_t v = __builtin_bswap16(ext[i]); std::memcpy(buf + i * 2, &v, 2); }
+                if (!host_->WriteOrdered(addr & ~3u, buf, 12)) std::memcpy(p, buf, 12);
                 host_->MemWritten(addr & ~3u, 12);
             }
             r.Skip(count - 2);
