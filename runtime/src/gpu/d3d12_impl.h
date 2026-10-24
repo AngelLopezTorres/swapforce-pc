@@ -79,6 +79,10 @@ struct HostRT {
     uint32_t xenosFormat = 0;   // ColorRenderTargetFormat o DepthRenderTargetFormat
     uint64_t lastUseDraw = 0;
     uint32_t writes = 0;
+    uint64_t resourceGeneration = 0;
+    uint64_t clearCount = 0, depthWriteCount = 0;
+    uint64_t lastClearFrame = 0, lastClearDraw = 0;
+    uint64_t lastDepthWriteFrame = 0, lastDepthWriteDraw = 0;
 };
 
 struct ResolveImage {            // resultado del ultimo resolve a una direccion (para presentar sin destilar)
@@ -130,6 +134,28 @@ public:
     uint64_t resolveReadbackBytes = 0;
     ComPtr<ID3D12Resource> depthReadback;      // plano de profundidad completo (copia D3D12)
     uint64_t depthReadbackBytes = 0;
+    struct DepthQueryRecord {
+        uint64_t frame = 0, draw = 0, source = 0;
+        uint64_t dsvPtr = 0, dsvGeneration = 0, rtvPtr = 0;
+        uint64_t priorClearCount = 0, priorDepthWriteCount = 0;
+        uint64_t lastClearFrame = 0, lastClearDraw = 0;
+        uint64_t lastDepthWriteFrame = 0, lastDepthWriteDraw = 0;
+        uint32_t indices = 0, issuedIndices = 0;
+        uint32_t primitive = 0, zfunc = 0, hostZfunc = 0, zEnable = 0, zWrite = 0;
+        uint32_t dsvFormat = 0, dsvDxgiFormat = 0, dsvWidth = 0, dsvHeight = 0;
+        uint32_t viewportX = 0, viewportY = 0, viewportWidth = 0, viewportHeight = 0;
+        uint32_t rtvWidth = 0, rtvHeight = 0;
+        uint32_t viewportInDsv = 0, scissorInDsv = 0, targetsCompatible = 0;
+        uint32_t depthClip = 0, writesDepth = 0, ndcZReversed = 0;
+        float zMin = 0.0f, zMax = 1.0f, ndcScaleZ = 1.0f, ndcOffsetZ = 0.0f;
+        int32_t scissor[4] = {};
+        uint64_t scissorBound = 0;
+    };
+    ComPtr<ID3D12QueryHeap> depthQueryHeap;
+    ComPtr<ID3D12Resource> depthQueryReadback;
+    uint32_t depthQueryCapacity = 0;
+    uint64_t depthQueryFrame = 0;
+    std::vector<DepthQueryRecord> depthQueryRecords;
     std::vector<uint8_t> depthResolveScratch;
     std::set<uint32_t> dumpSet;
     std::string adapterName;
@@ -236,6 +262,7 @@ public:
     const DxilBlob* GetRectGs();
     ID3D12PipelineState* GetPso(const ShaderInfo& vs, const ShaderInfo* ps, uint32_t topoClass, bool rectGs);
     bool DoDraw(const DrawEvent& ev, const ShaderInfo* vs, const ShaderInfo* ps);
+    void FinishDepthQueries(uint64_t frame);
     uint32_t AllocGpuSrv(uint32_t n);
 
     // ---- d3d12_rt.cpp ----

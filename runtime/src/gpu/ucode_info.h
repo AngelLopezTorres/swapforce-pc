@@ -8,7 +8,14 @@
 
 namespace rt::gpu {
 
-struct VFetchUse { uint32_t constIdx; uint32_t format; uint32_t stride; bool mini; };
+struct VFetchUse {
+    uint32_t constIdx = 0, format = 0, stride = 0;
+    bool mini = false;
+    uint32_t src = 0, srcSwizzle = 0, dest = 0, destSwizzle = 0;
+    int32_t offset = 0;
+    bool srcRelative = false, destRelative = false, indexRounded = false;
+    bool isSigned = false, normalized = false;
+};
 struct TFetchUse { uint32_t constIdx; uint32_t dim; uint32_t opcode; };
 
 struct ShaderInfo {

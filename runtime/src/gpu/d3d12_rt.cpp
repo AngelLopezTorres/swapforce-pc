@@ -66,6 +66,9 @@ HostRT* D3D12Backend::GetColorRT(uint32_t base, uint32_t pitch, uint32_t fmt, ui
         Note("SIMPLIFY render target de color ampliado en altura (se pierde el contenido previo)");
     }
     HostRT& rt = colorRTs[key];
+    ID3D12Resource* oldRes = rt.res.Get();
+    const uint32_t oldW = rt.w, oldH = rt.h;
+    const uint64_t oldGeneration = rt.resourceGeneration;
     D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_DEFAULT};
     D3D12_RESOURCE_DESC rd = {};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = w; rd.Height = h; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
@@ -76,18 +79,23 @@ HostRT* D3D12Backend::GetColorRT(uint32_t base, uint32_t pitch, uint32_t fmt, ui
         colorRTs.erase(key);
         return nullptr;
     }
-    bool fresh = !rt.res;
+    bool fresh = !oldRes;
     if (fresh) {
         if (rtvUsed >= 128) { Note("OMISION demasiados render targets de color"); colorRTs.erase(key); return nullptr; }
         rt.viewIdx = rtvUsed++;
     }
     rt.res = res; rt.state = D3D12_RESOURCE_STATE_RENDER_TARGET; rt.format = df; rt.w = w; rt.h = h; rt.depth = false; rt.xenosFormat = fmt;
+    rt.resourceGeneration = oldGeneration + 1;
+    rt.clearCount = rt.depthWriteCount = rt.lastClearFrame = rt.lastClearDraw = 0;
+    rt.lastDepthWriteFrame = rt.lastDepthWriteDraw = rt.lastUseDraw = 0;
+    rt.writes = 0;
     D3D12_CPU_DESCRIPTOR_HANDLE hd = rtvHeap->GetCPUDescriptorHandleForHeapStart();
     hd.ptr += (SIZE_T)rt.viewIdx * rtvInc;
     dev->CreateRenderTargetView(rt.res.Get(), nullptr, hd);
-    char b[160];
-    std::snprintf(b, sizeof(b), "RT color nuevo base=%u pitch=%u fmt=%s(%u) host=%ux%u dxgi=%u", base, pitch, ColorRtName(fmt), fmt, w, h, (uint32_t)df);
-    ImportLog::Get().Printf("D3D12 %s", b);
+    ImportLog::Get().Printf("D3D12 RT_RESOURCE frame=%llu kind=color base=%u pitch=%u xfmt=%u dxgi=%u old=%p oldgen=%llu olddim=%ux%u new=%p newgen=%llu newdim=%ux%u content_lost=%u",
+                            (unsigned long long)(rt::gpu::FrameCount() + 1), base, pitch, fmt, (uint32_t)df,
+                            (void*)oldRes, (unsigned long long)oldGeneration, oldW, oldH,
+                            (void*)rt.res.Get(), (unsigned long long)rt.resourceGeneration, rt.w, rt.h, oldRes ? 1u : 0u);
     return &rt;
 }
 
@@ -105,6 +113,9 @@ HostRT* D3D12Backend::GetDepthRT(uint32_t base, uint32_t pitch, uint32_t fmt, ui
         h = std::min(((needH + 255) & ~255u), 8192u);
     }
     HostRT& rt = depthRTs[key];
+    ID3D12Resource* oldRes = rt.res.Get();
+    const uint32_t oldW = rt.w, oldH = rt.h;
+    const uint64_t oldGeneration = rt.resourceGeneration;
     D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_DEFAULT};
     D3D12_RESOURCE_DESC rd = {};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = w; rd.Height = h; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
@@ -116,16 +127,23 @@ HostRT* D3D12Backend::GetDepthRT(uint32_t base, uint32_t pitch, uint32_t fmt, ui
         depthRTs.erase(key);
         return nullptr;
     }
-    bool fresh = !rt.res;
+    bool fresh = !oldRes;
     if (fresh) {
         if (dsvUsed >= 64) { Note("OMISION demasiados render targets de profundidad"); depthRTs.erase(key); return nullptr; }
         rt.viewIdx = dsvUsed++;
     }
     rt.res = res; rt.state = D3D12_RESOURCE_STATE_DEPTH_WRITE; rt.format = df; rt.w = w; rt.h = h; rt.depth = true; rt.xenosFormat = fmt;
+    rt.resourceGeneration = oldGeneration + 1;
+    rt.clearCount = rt.depthWriteCount = rt.lastClearFrame = rt.lastClearDraw = 0;
+    rt.lastDepthWriteFrame = rt.lastDepthWriteDraw = rt.lastUseDraw = 0;
+    rt.writes = 0;
     D3D12_CPU_DESCRIPTOR_HANDLE hd = dsvHeap->GetCPUDescriptorHandleForHeapStart();
     hd.ptr += (SIZE_T)rt.viewIdx * dsvInc;
     dev->CreateDepthStencilView(rt.res.Get(), nullptr, hd);
-    ImportLog::Get().Printf("D3D12 RT profundidad nuevo base=%u pitch=%u fmt=%u host=%ux%u dxgi=%u", base, pitch, fmt, w, h, (uint32_t)df);
+    ImportLog::Get().Printf("D3D12 RT_RESOURCE frame=%llu kind=depth base=%u pitch=%u xfmt=%u dxgi=%u old=%p oldgen=%llu olddim=%ux%u new=%p newgen=%llu newdim=%ux%u content_lost=%u",
+                            (unsigned long long)(rt::gpu::FrameCount() + 1), base, pitch, fmt, (uint32_t)df,
+                            (void*)oldRes, (unsigned long long)oldGeneration, oldW, oldH,
+                            (void*)rt.res.Get(), (unsigned long long)rt.resourceGeneration, rt.w, rt.h, oldRes ? 1u : 0u);
     return &rt;
 }
 
@@ -498,11 +516,18 @@ bool D3D12Backend::DoResolve(const DrawEvent& ev) {
             uint32_t cv = RV(0x231D);
             uint32_t d24 = (cv >> 8) & 0xFFFFFF;
             float dv = d->xenosFormat == 0 ? xenos::UNorm24To32(d24) : xenos::Float20e4To32(d24) * 0.5f;
-            { static uint64_t dcl = 0; if (dcl < 400) { ++dcl; ImportLog::Get().Printf("D3D12 DEPTHCLEAR frame=%llu base=%u dfmt=%u cv=%08X d24=%06X host=%g region=(%d,%d)-(%d,%d)", (unsigned long long)FrameCount(), (unsigned)(di.depth_base | (di.depth_base_bit_11 << 11)), (unsigned)di.depth_format, cv, d24, dv, x0, y0, x1, y1); } }
             Transition(d->res.Get(), d->state, D3D12_RESOURCE_STATE_DEPTH_WRITE); d->state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
             D3D12_CPU_DESCRIPTOR_HANDLE hd = dsvHeap->GetCPUDescriptorHandleForHeapStart();
             hd.ptr += (SIZE_T)d->viewIdx * dsvInc;
             cl->ClearDepthStencilView(hd, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, dv, (UINT8)(cv & 0xFF), 1, &rect);
+            ++d->clearCount;
+            d->lastClearFrame = rt::gpu::FrameCount() + 1;
+            d->lastClearDraw = drawSerial;
+            ImportLog::Get().Printf("D3D12 DEPTHCLEAR frame=%llu base=%u pitch=%u fmt=%u resource=%p gen=%llu clear=%llu value=%g region=(%d,%d)-(%d,%d)",
+                                    (unsigned long long)d->lastClearFrame, (unsigned)(di.depth_base | (di.depth_base_bit_11 << 11)),
+                                    surf.surface_pitch, (unsigned)di.depth_format, (void*)d->res.Get(),
+                                    (unsigned long long)d->resourceGeneration, (unsigned long long)d->clearCount,
+                                    dv, x0, y0, x1, y1);
         }
     }
     static uint64_t logged = 0;

@@ -80,7 +80,10 @@ bool AnalyzeUcode(bool vertex, const uint8_t* be, uint32_t dwords, ShaderInfo& o
                         if (!v.is_mini_fetch()) prevFull = v;
                         uint32_t ci = full.fetch_constant_index();
                         o.vfetchMask[ci / 32] |= 1u << (ci % 32);
-                        o.vfetch.push_back({ci, (uint32_t)v.data_format(), full.stride(), v.is_mini_fetch()});
+                        o.vfetch.push_back({ci, (uint32_t)v.data_format(), full.stride(), v.is_mini_fetch(),
+                                            full.src(), full.src_swizzle(), v.dest(), v.dest_swizzle(), v.offset(),
+                                            full.is_src_relative(), v.is_dest_relative(), full.is_index_rounded(),
+                                            v.is_signed(), v.is_normalized()});
                         regUse(v.dest(), v.is_dest_relative());
                         if (!v.is_mini_fetch()) regUse(full.src(), full.is_src_relative());
                     } else {

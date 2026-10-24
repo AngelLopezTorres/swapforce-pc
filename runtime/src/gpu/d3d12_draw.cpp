@@ -4,6 +4,7 @@
 // copias en runtime\ref\). Simplificaciones registradas con Note("SIMPLIFY ...").
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 #include "config.h"
 #include "d3d12_impl.h"
@@ -200,8 +201,13 @@ struct PsoState {
     uint32_t blend[4]; uint32_t colorMask;
     uint32_t depthControl; uint32_t stencilRead, stencilWrite;
     uint32_t modeCntl; uint32_t clipDisable;
-    uint32_t pad;
 };
+
+static D3D12_COMPARISON_FUNC DepthFuncToHost(uint32_t guestFunc) {
+    // Xenia mapea CompareFunction directamente a D3D12; el viewport conserva
+    // los valores Z del invitado aunque el NDC se invierta para ordenar el rango.
+    return (D3D12_COMPARISON_FUNC)((uint32_t)D3D12_COMPARISON_FUNC_NEVER + guestFunc);
+}
 
 ID3D12PipelineState* D3D12Backend::GetPso(const ShaderInfo& vsI, const ShaderInfo* psI, uint32_t topoClass, bool rectGs) {
     // el llamador deja el estado en `cur`; se reconstruye aqui a partir de los registros (mismos valores)
@@ -266,17 +272,7 @@ ID3D12PipelineState* D3D12Backend::GetPso(const ShaderInfo& vsI, const ShaderInf
     if (depthOn) {
         d.DepthStencilState.DepthEnable = TRUE;
         d.DepthStencilState.DepthWriteMask = depth.z_write_enable ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
-        d.DepthStencilState.DepthFunc = (D3D12_COMPARISON_FUNC)((uint32_t)D3D12_COMPARISON_FUNC_NEVER + (uint32_t)depth.zfunc);
-        // En esta ruta de viewport/EDRAM, invertir la comparacion Z reproduce
-        // la profundidad del titulo; la causa general aun no esta verificada.
-        auto& f = d.DepthStencilState.DepthFunc;
-        static const int dbgInv = std::getenv("XE_DBG_INV") ? std::atoi(std::getenv("XE_DBG_INV")) : 3;   // bit0: invertir en D24, bit1: invertir en D32F
-        const bool isF32 = st.dsvFmt != (uint32_t)DXGI_FORMAT_D24_UNORM_S8_UINT;
-        if (!((dbgInv >> (isF32 ? 1 : 0)) & 1)) {}
-        else if (f == D3D12_COMPARISON_FUNC_GREATER_EQUAL) f = D3D12_COMPARISON_FUNC_LESS_EQUAL;
-        else if (f == D3D12_COMPARISON_FUNC_GREATER) f = D3D12_COMPARISON_FUNC_LESS;
-        else if (f == D3D12_COMPARISON_FUNC_LESS_EQUAL) f = D3D12_COMPARISON_FUNC_GREATER_EQUAL;
-        else if (f == D3D12_COMPARISON_FUNC_LESS) f = D3D12_COMPARISON_FUNC_GREATER;
+        d.DepthStencilState.DepthFunc = DepthFuncToHost((uint32_t)depth.zfunc);
     }
     if (stencilOn) {
         d.DepthStencilState.StencilEnable = TRUE;
@@ -323,7 +319,7 @@ ID3D12PipelineState* D3D12Backend::GetPso(const ShaderInfo& vsI, const ShaderInf
 // ---- viewport (port de draw_util::GetHostViewportInfo con escala de resolucion 1, sin float24) ----
 struct ViewportInfo { uint32_t xy_offset[2], xy_extent[2]; float z_min, z_max, ndc_scale[3], ndc_offset[3]; };
 
-static void GetViewport(uint32_t xyMax, ViewportInfo& v, bool pixelShaderWritesDepth) {
+static void GetViewport(uint32_t xyMaxX, uint32_t xyMaxY, ViewportInfo& v, bool pixelShaderWritesDepth) {
     auto clip = R<reg::PA_CL_CLIP_CNTL>();
     auto vte = R<reg::PA_CL_VTE_CNTL>();
     auto mc = R<reg::PA_SU_SC_MODE_CNTL>();
@@ -342,7 +338,8 @@ static void GetViewport(uint32_t xyMax, ViewportInfo& v, bool pixelShaderWritesD
     if (clip.clip_disable) {
         for (int i = 0; i < 2; ++i) {
             v.xy_offset[i] = 0;
-            uint32_t ext = std::min(8192u, xyMax);
+            uint32_t xyMax = i ? xyMaxY : xyMaxX;
+            uint32_t ext = std::min(8192u, std::max(1u, xyMax));
             v.xy_extent[i] = ext;
             float e = (float)ext, p2n = 2.0f / e;
             ns[i] = scale_xy[i] * p2n;
@@ -351,7 +348,8 @@ static void GetViewport(uint32_t xyMax, ViewportInfo& v, bool pixelShaderWritesD
         z_min = 0.0f; z_max = 1.0f; ns[2] = scale_z; no[2] = off_z;
     } else {
         for (int i = 0; i < 2; ++i) {
-            float off = off_xy[i] + add_xy[i], sc = scale_xy[i], sa = std::fabs(sc), mx = (float)xyMax;
+            float off = off_xy[i] + add_xy[i], sc = scale_xy[i], sa = std::fabs(sc);
+            float mx = (float)(i ? xyMaxY : xyMaxX);
             uint32_t a0 = (uint32_t)std::min(std::max(off - sa, 0.0f), mx), a1 = (uint32_t)std::min(std::max(off + sa, 0.0f), mx);
             uint32_t ext = a1 - a0;
             v.xy_offset[i] = a0; v.xy_extent[i] = ext;
@@ -387,6 +385,259 @@ static void GetScissor(int32_t out[4]) {   // x0, y0, x1, y1
     tlx = std::max(tlx, 0); tly = std::max(tly, 0);
     brx = std::max(brx, tlx); bry = std::max(bry, tly);
     out[0] = tlx; out[1] = tly; out[2] = brx; out[3] = bry;
+}
+
+static bool DumpDepthSnapshot(D3D12Backend& backend, HostRT& depth, uint32_t base, uint32_t pitch,
+                              uint64_t frame, uint64_t draw, uint32_t zfunc, const char* stage) {
+    const D3D12_RESOURCE_DESC desc = depth.res->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
+    UINT rows = 0;
+    UINT64 rowBytes = 0, totalBytes = 0;
+    backend.dev->GetCopyableFootprints(&desc, 0, 1, 0, &fp, &rows, &rowBytes, &totalBytes);
+    const DXGI_FORMAT format = fp.Footprint.Format;
+    const bool f32 = format == DXGI_FORMAT_R32_TYPELESS || format == DXGI_FORMAT_R32_FLOAT;
+    const bool d24 = format == DXGI_FORMAT_R24G8_TYPELESS || format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    if ((!f32 && !d24) || rows != desc.Height || totalBytes == 0 || totalBytes > (128ull << 20)) {
+        ImportLog::Get().Printf("D3D12 DEPTH_SNAPSHOT frame=%llu draw=%llu stage=%s base=%u pitch=%u fmt=%u footprint=%u rows=%u bytes=%llu -> NO SOPORTADO",
+                                (unsigned long long)frame, (unsigned long long)draw, stage, base, pitch,
+                                depth.xenosFormat, (unsigned)format, rows, (unsigned long long)totalBytes);
+        return false;
+    }
+    if (!backend.depthReadback || backend.depthReadbackBytes < totalBytes) {
+        D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_READBACK};
+        D3D12_RESOURCE_DESC bd = {};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = totalBytes;
+        bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        backend.depthReadback.Reset();
+        backend.depthReadbackBytes = totalBytes;
+        if (!backend.Hr(backend.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                              nullptr, IID_PPV_ARGS(&backend.depthReadback)),
+                        "CreateCommittedResource(snapshot profundidad)")) return false;
+    }
+
+    const D3D12_RESOURCE_STATES oldState = depth.state;
+    backend.Transition(depth.res.Get(), oldState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    depth.state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    D3D12_TEXTURE_COPY_LOCATION from = {}, to = {};
+    from.pResource = depth.res.Get(); from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; from.SubresourceIndex = 0;
+    to.pResource = backend.depthReadback.Get(); to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; to.PlacedFootprint = fp;
+    backend.cl->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    backend.Transition(depth.res.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, oldState);
+    depth.state = oldState;
+    backend.FlushAndWait();
+
+    void* mapped = nullptr;
+    D3D12_RANGE readRange = {0, (SIZE_T)totalBytes};
+    if (!backend.Hr(backend.depthReadback->Map(0, &readRange, &mapped), "Map(snapshot profundidad)")) return false;
+
+    char name[160];
+    std::snprintf(name, sizeof(name), "\\depth_f%05llu_draw%llu_base%03X_%s.f32",
+                  (unsigned long long)frame, (unsigned long long)draw, base, stage);
+    const std::string path = rt::gpu::FramesDir() + name;
+    FILE* dump = std::fopen(path.c_str(), "wb");
+    std::vector<float> row(desc.Width);
+    double sum = 0.0;
+    float minValue = std::numeric_limits<float>::infinity();
+    float maxValue = -std::numeric_limits<float>::infinity();
+    uint64_t finite = 0, nonFinite = 0, zero = 0, one = 0, belowPoint2 = 0, atPoint2 = 0;
+    uint64_t bins[8] = {};
+    for (uint32_t y = 0; y < desc.Height; ++y) {
+        const uint8_t* src = static_cast<const uint8_t*>(mapped) + (size_t)y * fp.Footprint.RowPitch;
+        for (uint32_t x = 0; x < desc.Width; ++x) {
+            float value;
+            if (f32) std::memcpy(&value, src + (size_t)x * 4, sizeof(value));
+            else {
+                uint32_t bits;
+                std::memcpy(&bits, src + (size_t)x * 4, sizeof(bits));
+                value = (float)(bits & 0x00FFFFFFu) * (1.0f / 16777215.0f);
+            }
+            row[x] = value;
+            if (!std::isfinite(value)) { ++nonFinite; continue; }
+            ++finite; sum += value;
+            minValue = std::min(minValue, value); maxValue = std::max(maxValue, value);
+            if (value <= 1.0e-7f) ++zero;
+            if (value >= 0.999999f) ++one;
+            if (value < 0.2f) ++belowPoint2;
+            if (std::fabs(value - 0.2f) < 1.0e-5f) ++atPoint2;
+            const int bin = value < 0.0f ? 0 : value >= 1.0f ? 7 : std::min(6, (int)(value * 7.0f));
+            ++bins[bin];
+        }
+        if (dump && std::fwrite(row.data(), sizeof(float), row.size(), dump) != row.size()) {
+            std::fclose(dump); dump = nullptr;
+        }
+    }
+    if (dump) std::fclose(dump);
+    D3D12_RANGE writeRange = {0, 0};
+    backend.depthReadback->Unmap(0, &writeRange);
+    ImportLog::Get().Printf("D3D12 DEPTH_SNAPSHOT frame=%llu draw=%llu stage=%s base=%u pitch=%u fmt=%u zfunc=%u host=%ux%u footprint=%u row=%u valores=%llu no_finitos=%llu min=%.9g max=%.9g media=%.9g cero=%llu uno=%llu lt02=%llu eq02=%llu bins=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu dump=%s",
+                            (unsigned long long)frame, (unsigned long long)draw, stage,
+                            base, pitch, depth.xenosFormat, zfunc,
+                            (uint32_t)desc.Width, (uint32_t)desc.Height, (unsigned)format, fp.Footprint.RowPitch,
+                            (unsigned long long)finite, (unsigned long long)nonFinite,
+                            finite ? minValue : 0.0f, finite ? maxValue : 0.0f, finite ? sum / finite : 0.0,
+                            (unsigned long long)zero, (unsigned long long)one, (unsigned long long)belowPoint2,
+                            (unsigned long long)atPoint2,
+                            (unsigned long long)bins[0], (unsigned long long)bins[1], (unsigned long long)bins[2], (unsigned long long)bins[3],
+                            (unsigned long long)bins[4], (unsigned long long)bins[5], (unsigned long long)bins[6], (unsigned long long)bins[7],
+                            dump ? path.c_str() : "FALLO");
+    return dump != nullptr;
+}
+
+void D3D12Backend::FinishDepthQueries(uint64_t frame) {
+    if (depthQueryFrame != frame || depthQueryRecords.empty() || !depthQueryHeap || !depthQueryReadback) return;
+    const uint32_t count = (uint32_t)depthQueryRecords.size();
+    if (!clOpen) BeginList();
+    if (!clOpen) return;
+    cl->ResolveQueryData(depthQueryHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, 0, count,
+                         depthQueryReadback.Get(), 0);
+    FlushAndWait();
+
+    void* mapped = nullptr;
+    D3D12_RANGE readRange = {0, (SIZE_T)count * sizeof(uint64_t)};
+    if (!Hr(depthQueryReadback->Map(0, &readRange, &mapped), "Map(occlusion por draw)")) {
+        ImportLog::Get().Printf("D3D12 OCCLUSION_SUMMARY frame=%llu draws=%u map=FALLO",
+                                (unsigned long long)frame, count);
+        depthQueryRecords.clear(); depthQueryFrame = 0;
+        return;
+    }
+    const uint64_t* samples = static_cast<const uint64_t*>(mapped);
+    uint64_t zero = 0, nonzero = 0, total = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        const DepthQueryRecord& q = depthQueryRecords[i];
+        const uint64_t n = samples[i];
+        if (!n) ++zero; else ++nonzero;
+        total += n;
+        const double ratio = q.scissorBound ? (double)n / (double)q.scissorBound : 0.0;
+        ImportLog::Get().Printf("D3D12 OCCLUSION frame=%llu draw=%llu src=%llu prim=%u zfunc=%u host_zfunc=%u zen=%u zwr=%u dsv_fmt=%u dsv_dxgi=%u dsv=%p gen=%llu dsv_dims=%ux%u rtv=%p rtv_dims=%ux%u targets_compatible=%u viewport=(%u,%u %ux%u) viewport_in_dsv=%u scissor=(%d,%d)-(%d,%d) scissor_in_dsv=%u viewport_z=%.7g..%.7g ndc_z=(%.7g,%.7g) depthclip=%u ndc_reversed=%u psdepth=%u indices=%u issued=%u samples=%llu scissor_bound=%llu samples_per_bound=%.9g prior_clear=%llu clear_at=%llu/%llu prior_write_draws=%llu write_at=%llu/%llu",
+                                (unsigned long long)q.frame, (unsigned long long)q.draw,
+                                (unsigned long long)q.source,
+                                q.primitive, q.zfunc, q.hostZfunc, q.zEnable, q.zWrite, q.dsvFormat,
+                                q.dsvDxgiFormat,
+                                (void*)(uintptr_t)q.dsvPtr, (unsigned long long)q.dsvGeneration,
+                                q.dsvWidth, q.dsvHeight, (void*)(uintptr_t)q.rtvPtr,
+                                q.rtvWidth, q.rtvHeight, q.targetsCompatible,
+                                q.viewportX, q.viewportY, q.viewportWidth, q.viewportHeight,
+                                q.viewportInDsv, q.scissor[0], q.scissor[1], q.scissor[2], q.scissor[3],
+                                q.scissorInDsv, q.zMin, q.zMax, q.ndcScaleZ, q.ndcOffsetZ,
+                                q.depthClip, q.ndcZReversed, q.writesDepth, q.indices, q.issuedIndices,
+                                (unsigned long long)n, (unsigned long long)q.scissorBound, ratio,
+                                (unsigned long long)q.priorClearCount,
+                                (unsigned long long)q.lastClearFrame, (unsigned long long)q.lastClearDraw,
+                                (unsigned long long)q.priorDepthWriteCount,
+                                (unsigned long long)q.lastDepthWriteFrame, (unsigned long long)q.lastDepthWriteDraw);
+    }
+    D3D12_RANGE writeRange = {0, 0};
+    depthQueryReadback->Unmap(0, &writeRange);
+    ImportLog::Get().Printf("D3D12 OCCLUSION_SUMMARY frame=%llu draws=%u zero=%llu nonzero=%llu samples=%llu",
+                            (unsigned long long)frame, count, (unsigned long long)zero,
+                            (unsigned long long)nonzero, (unsigned long long)total);
+    depthQueryRecords.clear();
+    depthQueryFrame = 0;
+}
+
+static uint32_t VertexFormatBytes(uint32_t format) {
+    switch ((xenos::VertexFormat)format) {
+        case xenos::VertexFormat::k_8_8_8_8:
+        case xenos::VertexFormat::k_2_10_10_10:
+        case xenos::VertexFormat::k_10_11_11:
+        case xenos::VertexFormat::k_11_11_10:
+        case xenos::VertexFormat::k_16_16:
+        case xenos::VertexFormat::k_16_16_FLOAT:
+        case xenos::VertexFormat::k_32:
+        case xenos::VertexFormat::k_32_FLOAT:
+            return 4;
+        case xenos::VertexFormat::k_16_16_16_16:
+        case xenos::VertexFormat::k_16_16_16_16_FLOAT:
+        case xenos::VertexFormat::k_32_32:
+        case xenos::VertexFormat::k_32_32_FLOAT:
+            return 8;
+        case xenos::VertexFormat::k_32_32_32_FLOAT:
+            return 12;
+        case xenos::VertexFormat::k_32_32_32_32:
+        case xenos::VertexFormat::k_32_32_32_32_FLOAT:
+            return 16;
+        default:
+            return 0;
+    }
+}
+
+static void DumpGuestVertexInputs(const ShaderInfo& vs, uint64_t frame, uint64_t draw,
+                                 uint32_t vte, uint32_t drawSource, uint32_t indexOffset,
+                                 uint32_t vertexCount) {
+    ImportLog::Get().Printf("D3D12 GUEST_VS_INPUT frame=%llu draw=%llu shader=%016llX dwords=%u vte=%08X draw_src=%u vgt_index_offset=%u vfetches=%u float_dynamic=%u",
+                            (unsigned long long)frame, (unsigned long long)draw,
+                            (unsigned long long)vs.hash, vs.dwords, vte, drawSource, indexOffset,
+                            (uint32_t)vs.vfetch.size(), vs.floatDynamic ? 1u : 0u);
+    for (const VFetchUse& vf : vs.vfetch) {
+        const uint32_t reg = 0x4800 + (vf.constIdx / 3) * 6 + (vf.constIdx % 3) * 2;
+        const uint32_t d0 = RegRead(reg), d1 = RegRead(reg + 1);
+        const uint32_t base = d0 & 0xFFFFFFFCu;
+        const uint32_t sizeBytes = ((d1 >> 2) & 0xFFFFFFu) * 4u;
+        char comp = "xyzw"[vf.srcSwizzle & 3u];
+        ImportLog::Get().Printf("D3D12 GUEST_VFETCH frame=%llu draw=%llu shader=%016llX const=%u mini=%u src=r%u.%c src_rel=%u rounded=%u dest=r%u swizzle=%03X fmt=%u signed=%u normalized=%u offset_dw=%d stride_dw=%u descriptor=(%08X,%08X) base=%08X size=%u endian=%u",
+                                (unsigned long long)frame, (unsigned long long)draw,
+                                (unsigned long long)vs.hash, vf.constIdx, vf.mini ? 1u : 0u,
+                                vf.src, comp, vf.srcRelative ? 1u : 0u, vf.indexRounded ? 1u : 0u,
+                                vf.dest, vf.destSwizzle, vf.format, vf.isSigned ? 1u : 0u,
+                                vf.normalized ? 1u : 0u, vf.offset, vf.stride, d0, d1,
+                                base, sizeBytes, d1 & 3u);
+        const uint32_t readBytes = VertexFormatBytes(vf.format);
+        for (uint32_t vertexId = 0; vertexId < vertexCount; ++vertexId) {
+            const uint32_t fetchIndex = vertexId + indexOffset;
+            const int64_t relBytes = ((int64_t)fetchIndex * vf.stride + vf.offset) * 4;
+            const int64_t guestAddress64 = (int64_t)base + relBytes;
+            if (!readBytes || guestAddress64 < 0 || guestAddress64 > 0x1FFFFFFFu || relBytes < 0 ||
+                (sizeBytes && (uint64_t)relBytes + readBytes > sizeBytes)) {
+                ImportLog::Get().Printf("D3D12 GUEST_VTX frame=%llu draw=%llu const=%u vertex_id=%u fetch_index=%u draw_src=%u address=OUT_OF_DESCRIPTOR rel_bytes=%lld read_bytes=%u",
+                                        (unsigned long long)frame, (unsigned long long)draw,
+                                        vf.constIdx, vertexId, fetchIndex, drawSource,
+                                        (long long)relBytes, readBytes);
+                continue;
+            }
+            const uint32_t address = (uint32_t)guestAddress64 & 0x1FFFFFFFu;
+            const uint8_t* mem = PhysHost(address, readBytes);
+            if (!mem) {
+                ImportLog::Get().Printf("D3D12 GUEST_VTX frame=%llu draw=%llu const=%u vertex_id=%u fetch_index=%u draw_src=%u address=%08X read_bytes=%u PhysHost=NULL",
+                                        (unsigned long long)frame, (unsigned long long)draw,
+                                        vf.constIdx, vertexId, fetchIndex, drawSource, address, readBytes);
+                continue;
+            }
+            std::string raw, swapped;
+            float pos[3] = {};
+            for (uint32_t b = 0; b < readBytes; ++b) {
+                char token[4]; std::snprintf(token, sizeof(token), "%s%02X", b ? " " : "", mem[b]); raw += token;
+            }
+            for (uint32_t wordIndex = 0; wordIndex < readBytes / 4; ++wordIndex) {
+                uint32_t word; std::memcpy(&word, mem + wordIndex * 4, 4);
+                word = GpuSwap32(word, d1 & 3u);
+                char token[20]; std::snprintf(token, sizeof(token), "%s%08X", wordIndex ? " " : "", word); swapped += token;
+                if (wordIndex < 3) std::memcpy(&pos[wordIndex], &word, 4);
+            }
+            const bool xyzFloat = vf.format == (uint32_t)xenos::VertexFormat::k_32_32_32_FLOAT;
+            ImportLog::Get().Printf("D3D12 GUEST_VTX frame=%llu draw=%llu shader=%016llX const=%u vertex_id=%u fetch_index=%u draw_src=%u address=%08X endian=%u bytes=%u raw=[%s] swapped_words=[%s]%s",
+                                    (unsigned long long)frame, (unsigned long long)draw,
+                                    (unsigned long long)vs.hash, vf.constIdx, vertexId, fetchIndex, drawSource, address,
+                                    d1 & 3u, readBytes, raw.c_str(), swapped.c_str(),
+                                    xyzFloat ? "" : " position_decode=not_xyz_float32");
+            if (xyzFloat)
+                ImportLog::Get().Printf("D3D12 GUEST_VTX_POS frame=%llu draw=%llu const=%u vertex_id=%u fetch_index=%u x=%.9g y=%.9g z=%.9g",
+                                        (unsigned long long)frame, (unsigned long long)draw,
+                                        vf.constIdx, vertexId, fetchIndex, pos[0], pos[1], pos[2]);
+        }
+    }
+    for (uint32_t c = 0; c < 256; ++c) {
+        if (!(vs.floatBitmap[c / 64] & (1ull << (c % 64)))) continue;
+        uint32_t bits[4]; float value[4];
+        for (uint32_t lane = 0; lane < 4; ++lane) {
+            bits[lane] = RegRead(0x4000 + c * 4 + lane);
+            std::memcpy(&value[lane], &bits[lane], sizeof(float));
+        }
+        ImportLog::Get().Printf("D3D12 GUEST_VS_CONST frame=%llu draw=%llu shader=%016llX c%u bits=(%08X,%08X,%08X,%08X) float=(%.9g,%.9g,%.9g,%.9g)",
+                                (unsigned long long)frame, (unsigned long long)draw,
+                                (unsigned long long)vs.hash, c, bits[0], bits[1], bits[2], bits[3],
+                                value[0], value[1], value[2], value[3]);
+    }
 }
 
 bool D3D12Backend::DoDraw(const DrawEvent& ev, const ShaderInfo* vs, const ShaderInfo* ps) {
@@ -448,14 +699,47 @@ bool D3D12Backend::DoDraw(const DrawEvent& ev, const ShaderInfo* vs, const Shade
     auto dc = R<reg::RB_DEPTHCONTROL>();
     bool depthUsed = (dc.z_enable && !(dc.zfunc == xenos::CompareFunction::kAlways && !dc.z_write_enable)) || dc.stencil_enable;
     HostRT* dRT = nullptr;
+    uint32_t depthBase = 0, depthFormat = 0;
     if (depthUsed) {
         auto di = R<reg::RB_DEPTH_INFO>();
-        dRT = GetDepthRT(di.depth_base | (di.depth_base_bit_11 << 11), surf.surface_pitch, (uint32_t)di.depth_format, needH);
+        depthBase = di.depth_base | (di.depth_base_bit_11 << 11);
+        depthFormat = (uint32_t)di.depth_format;
+        dRT = GetDepthRT(depthBase, surf.surface_pitch, depthFormat, needH);
         if (!dRT) { Note("OMISION draw: no se pudo crear el render target de profundidad"); return false; }
+    }
+    if (dRT && rt::gpu::Cfg().stateLog && rt::gpu::Cfg().stateLogFrame &&
+        rt::gpu::FrameCount() + 1 == rt::gpu::Cfg().stateLogFrame) {
+        static uint64_t depthDumpFrame = 0;
+        static std::set<uint64_t> depthStartDumped, depthCompareDumped;
+        const uint64_t frame = rt::gpu::FrameCount() + 1;
+        if (depthDumpFrame != frame) {
+            depthDumpFrame = frame;
+            depthStartDumped.clear();
+            depthCompareDumped.clear();
+        }
+        const uint64_t key = (uint64_t)depthBase | ((uint64_t)surf.surface_pitch << 12) | ((uint64_t)depthFormat << 32);
+        const bool relational = dc.z_enable && dc.zfunc != xenos::CompareFunction::kAlways;
+        if (!depthStartDumped.count(key)) {
+            DumpDepthSnapshot(*this, *dRT, depthBase, surf.surface_pitch, frame, drawSerial, (uint32_t)dc.zfunc,
+                              relational ? "start_pre_compare" : "start_pre_draw");
+            depthStartDumped.insert(key);
+            if (relational) depthCompareDumped.insert(key);
+        } else if (relational && !depthCompareDumped.count(key)) {
+            DumpDepthSnapshot(*this, *dRT, depthBase, surf.surface_pitch, frame, drawSerial, (uint32_t)dc.zfunc,
+                              "post_clear_pre_compare");
+            depthCompareDumped.insert(key);
+        }
     }
     if (colorMode && !nrt && !dRT) return true;   // nada que escribir
     for (uint32_t i = 0; i < 4; ++i) g_psoRtFmt[i] = (i < nrt && cRT[i]) ? (uint32_t)cRT[i]->format : 0;
     g_psoNrt = nrt; g_psoDsvFmt = dRT ? (uint32_t)dRT->format : 0;
+    ViewportInfo vp;
+    // clip_disable usa un viewport host que cubre el destino guest activo.
+    // No se debe usar el limite global D3D12 como maximo guest de ambos ejes.
+    GetViewport(surf.surface_pitch, needH, vp, ps && ps->writesDepth);
+    // Solo diagnóstico: indica si el shader transforma Z con signo negativo.
+    // La función de comparación Xenos se mapea directamente a D3D12.
+    const bool ndcZReversed = !(ps && ps->writesDepth) && vp.ndc_scale[2] < 0.0f;
     // ---- PSO ----
     ID3D12PipelineState* pso = GetPso(*vs, colorMode ? ps : nullptr, topoClass, rectGs);
     if (!pso) { Note("OMISION draw: sin PSO (shader_fail/pso_fail)"); return false; }
@@ -493,8 +777,6 @@ bool D3D12Backend::DoDraw(const DrawEvent& ev, const ShaderInfo* vs, const Shade
         c->draw2[2] = (vte.vtx_xy_fmt ? 1u : 0u) | (vte.vtx_z_fmt ? 2u : 0u) | (vte.vtx_w0_fmt ? 4u : 0u);
         c->draw2[3] = 0;
     }
-    ViewportInfo vp;
-    GetViewport(D3D12_VIEWPORT_BOUNDS_MAX, vp, ps && ps->writesDepth);
     for (int i = 0; i < 3; ++i) { c->ndcScale[i] = vp.ndc_scale[i]; c->ndcOffset[i] = vp.ndc_offset[i]; }
     c->ndcScale[3] = 1.0f; c->ndcOffset[3] = 0.0f;
     if (const char* dbg = std::getenv("XE_DBG_PS")) {   // depuracion: constantes y primeros bytes de textura para un PS (hash hexadecimal)
@@ -673,23 +955,56 @@ bool D3D12Backend::DoDraw(const DrawEvent& ev, const ShaderInfo* vs, const Shade
     D3D12_VIEWPORT v = {(float)vp.xy_offset[0], (float)vp.xy_offset[1], (float)vp.xy_extent[0], (float)vp.xy_extent[1], vp.z_min, vp.z_max};
     if (rt::gpu::Cfg().stateLog && rt::gpu::Cfg().stateLogFrame && rt::gpu::FrameCount() + 1 == rt::gpu::Cfg().stateLogFrame) {
         auto zc = R<reg::RB_DEPTHCONTROL>();
-        ImportLog::Get().Printf("D3D12 ZSTATE frame=%llu draw=%llu zfunc=%u zen=%u zwr=%u zmin=%g zmax=%g nz=(%g,%g) clipdis=%u dxclip=%u dfmt=%u vte=%08X", (unsigned long long)(rt::gpu::FrameCount() + 1), (unsigned long long)ev.src, (unsigned)zc.zfunc, (unsigned)zc.z_enable, (unsigned)zc.z_write_enable, vp.z_min, vp.z_max, vp.ndc_scale[2], vp.ndc_offset[2], (unsigned)R<reg::PA_CL_CLIP_CNTL>().clip_disable, (unsigned)R<reg::PA_CL_CLIP_CNTL>().dx_clip_space_def, dRT ? dRT->xenosFormat : 99u, RV(0x2206));
+        ImportLog::Get().Printf("D3D12 ZSTATE frame=%llu draw=%llu serial=%llu psdepth=%u pshash=%016llX ndc_reversed=%u zfunc=%u host_zfunc=%u zen=%u zwr=%u zmin=%.7g zmax=%.7g ndc_z=(%.7g,%.7g) vte_z=(%.7g,%.7g) depthclip=%u clipdis=%u dxclip=%u dsv_fmt=%u dsv_dxgi=%u dsv=%p gen=%llu clear=%llu clear_at=%llu/%llu write_draws=%llu write_at=%llu/%llu vte=%08X",
+                                (unsigned long long)(rt::gpu::FrameCount() + 1),
+                                (unsigned long long)ev.src, (unsigned long long)drawSerial,
+                                (unsigned)(ps && ps->writesDepth), (unsigned long long)(ps ? ps->hash : 0),
+                                (unsigned)ndcZReversed, (unsigned)zc.zfunc,
+                                (unsigned)DepthFuncToHost((uint32_t)zc.zfunc),
+                                (unsigned)zc.z_enable, (unsigned)zc.z_write_enable,
+                                vp.z_min, vp.z_max, vp.ndc_scale[2], vp.ndc_offset[2],
+                                RF(0x2113), RF(0x2114),
+                                R<reg::PA_CL_CLIP_CNTL>().clip_disable ? 0u : 1u,
+                                (unsigned)R<reg::PA_CL_CLIP_CNTL>().clip_disable,
+                                (unsigned)R<reg::PA_CL_CLIP_CNTL>().dx_clip_space_def,
+                                dRT ? dRT->xenosFormat : 99u, dRT ? (uint32_t)dRT->format : 0u,
+                                dRT ? (void*)dRT->res.Get() : nullptr,
+                                (unsigned long long)(dRT ? dRT->resourceGeneration : 0u),
+                                (unsigned long long)(dRT ? dRT->clearCount : 0u),
+                                (unsigned long long)(dRT ? dRT->lastClearFrame : 0u),
+                                (unsigned long long)(dRT ? dRT->lastClearDraw : 0u),
+                                (unsigned long long)(dRT ? dRT->depthWriteCount : 0u),
+                                (unsigned long long)(dRT ? dRT->lastDepthWriteFrame : 0u),
+                                (unsigned long long)(dRT ? dRT->lastDepthWriteDraw : 0u), RV(0x2206));
     }
     cl->RSSetViewports(1, &v);
     uint32_t rtw = cRT[0] ? cRT[0]->w : (dRT ? dRT->w : surf.surface_pitch), rth = cRT[0] ? cRT[0]->h : (dRT ? dRT->h : 1024);
     D3D12_RECT r = {sc[0], sc[1], std::min<int32_t>(sc[2], (int32_t)rtw), std::min<int32_t>(sc[3], (int32_t)rth)};
     if (r.right <= r.left || r.bottom <= r.top) return true;     // scissor vacio
+    const bool viewportInDsv = !dRT ||
+        ((uint64_t)vp.xy_offset[0] + vp.xy_extent[0] <= dRT->w &&
+         (uint64_t)vp.xy_offset[1] + vp.xy_extent[1] <= dRT->h);
+    const bool scissorInDsv = !dRT ||
+        (r.left >= 0 && r.top >= 0 && r.right <= (int32_t)dRT->w && r.bottom <= (int32_t)dRT->h);
+    bool targetsCompatible = true;
+    if (dRT && nrt) {
+        for (uint32_t i = 0; i < nrt; ++i)
+            if (!cRT[i] || cRT[i]->w != dRT->w || cRT[i]->h != dRT->h) targetsCompatible = false;
+    }
     const bool rasterLog = rt::gpu::Cfg().stateLog;
     const uint64_t stateFrame = rasterLog ? rt::gpu::FrameCount() + 1 : 0;
     if (rasterLog && (!rt::gpu::Cfg().stateLogFrame || stateFrame == rt::gpu::Cfg().stateLogFrame)) {
-        char b[1024];
+        char b[1536];
         const HostRT* c0 = cRT[0];
         std::snprintf(b, sizeof(b),
-                      "DRAWRASTER frame=%llu draw=%llu raw(surface=%08X color=%08X depth=%08X depthctl=%08X clip=%08X scmode=%08X vte=%08X "
+                      "DRAWRASTER frame=%llu draw=%llu vs=%016llX ps=%016llX prim=%u indices=%u count=%u rectgs=%u raw(surface=%08X color=%08X depth=%08X depthctl=%08X clip=%08X scmode=%08X vte=%08X "
                       "win=(%08X,%08X,%08X) screen=(%08X,%08X) vreg=(%08X,%08X,%08X,%08X,%08X,%08X)) "
                       "scissor=(%d,%d)-(%d,%d) host=(%ld,%ld)-(%ld,%ld) viewport=(%u,%u %ux%u z=%.6g..%.6g) "
-                      "rt=%08X pitch=%u fmt=%u %ux%u msaa=%u dsv=%08X fmt=%u pitch=%u %ux%u",
+                      "rt=%08X pitch=%u fmt=%u %ux%u msaa=%u rtv0=%p dsv=%08X fmt=%u dxgi=%u resource=%p gen=%llu pitch=%u %ux%u "
+                      "vp_in_dsv=%u scissor_in_dsv=%u targets_compatible=%u depthclip=%u ndc_xy=(%.7g,%.7g;%.7g,%.7g) ndc_z=(%.7g,%.7g)",
                       (unsigned long long)stateFrame, (unsigned long long)drawSerial,
+                      (unsigned long long)(vs ? vs->hash : 0), (unsigned long long)(ps ? ps->hash : 0),
+                      prim, ev.nIdx, count, rectGs ? 1u : 0u,
                       RV(0x2000), RV(0x2001), RV(0x2002), RV(0x2200), RV(0x2204), RV(0x2205), RV(0x2206),
                       RV(0x2080), RV(0x2081), RV(0x2082), RV(0x200E), RV(0x200F),
                       RV(0x210F), RV(0x2110), RV(0x2111), RV(0x2112), RV(0x2113), RV(0x2114),
@@ -697,14 +1012,151 @@ bool D3D12Backend::DoDraw(const DrawEvent& ev, const ShaderInfo* vs, const Shade
                       vp.xy_offset[0], vp.xy_offset[1], vp.xy_extent[0], vp.xy_extent[1], vp.z_min, vp.z_max,
                       c0 ? (RV(0x2001) & 0xFFFu) : 0u, surf.surface_pitch, c0 ? c0->xenosFormat : 0u,
                       c0 ? c0->w : 0u, c0 ? c0->h : 0u, (uint32_t)surf.msaa_samples,
-                      RV(0x2002), dRT ? dRT->xenosFormat : 0u, surf.surface_pitch, dRT ? dRT->w : 0u, dRT ? dRT->h : 0u);
+                      c0 ? (void*)c0->res.Get() : nullptr, RV(0x2002), dRT ? dRT->xenosFormat : 0u,
+                      dRT ? (uint32_t)dRT->format : 0u, dRT ? (void*)dRT->res.Get() : nullptr,
+                      (unsigned long long)(dRT ? dRT->resourceGeneration : 0u), surf.surface_pitch,
+                      dRT ? dRT->w : 0u, dRT ? dRT->h : 0u,
+                      viewportInDsv, scissorInDsv, targetsCompatible,
+                      R<reg::PA_CL_CLIP_CNTL>().clip_disable ? 0u : 1u,
+                      vp.ndc_scale[0], vp.ndc_offset[0], vp.ndc_scale[1], vp.ndc_offset[1], vp.ndc_scale[2], vp.ndc_offset[2]);
         ImportLog::Get().Printf("D3D12 %s", b);
     }
     cl->RSSetScissorRects(1, &r);
     float bf[4] = {RF(0x2105), RF(0x2106), RF(0x2107), RF(0x2108)};
     cl->OMSetBlendFactor(bf);
     cl->OMSetStencilRef(R<reg::RB_STENCILREFMASK>().stencilref);
+    const uint64_t frame = rt::gpu::FrameCount() + 1;
+    bool queryDraw = rt::gpu::Cfg().stateLog && rt::gpu::Cfg().stateLogFrame == frame;
+    if (queryDraw && depthQueryFrame != frame) {
+        if (!depthQueryRecords.empty()) {
+            ImportLog::Get().Printf("D3D12 OCCLUSION abandoned_frame=%llu next_frame=%llu draws=%zu",
+                                    (unsigned long long)depthQueryFrame, (unsigned long long)frame,
+                                    depthQueryRecords.size());
+            depthQueryRecords.clear();
+        }
+        depthQueryFrame = frame;
+    }
+    if (queryDraw && !depthQueryHeap) {
+        D3D12_QUERY_HEAP_DESC qd = {};
+        qd.Type = D3D12_QUERY_HEAP_TYPE_OCCLUSION;
+        qd.Count = 16384;
+        if (Hr(dev->CreateQueryHeap(&qd, IID_PPV_ARGS(&depthQueryHeap)), "CreateQueryHeap(occlusion por draw)")) {
+            depthQueryCapacity = qd.Count;
+            D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_READBACK};
+            D3D12_RESOURCE_DESC bd = {};
+            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bd.Width = (UINT64)depthQueryCapacity * sizeof(uint64_t);
+            bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+            bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (!Hr(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
+                                                  D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                  IID_PPV_ARGS(&depthQueryReadback)),
+                    "CreateCommittedResource(readback de occlusion)")) {
+                depthQueryHeap.Reset(); depthQueryCapacity = 0;
+            }
+        }
+    }
+    const uint32_t queryIndex = (uint32_t)depthQueryRecords.size();
+    if (queryDraw && (!depthQueryHeap || !depthQueryReadback || queryIndex >= depthQueryCapacity)) {
+        static uint64_t overflowFrame = 0;
+        if (overflowFrame != frame) {
+            overflowFrame = frame;
+            ImportLog::Get().Printf("D3D12 OCCLUSION unavailable frame=%llu heap=%u readback=%u index=%u capacity=%u",
+                                    (unsigned long long)frame, depthQueryHeap ? 1u : 0u,
+                                    depthQueryReadback ? 1u : 0u, queryIndex, depthQueryCapacity);
+        }
+        queryDraw = false;
+    }
+    if (queryDraw) cl->BeginQuery(depthQueryHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, queryIndex);
     cl->DrawInstanced(count, 1, 0, 0);
+    if (queryDraw) {
+        cl->EndQuery(depthQueryHeap.Get(), D3D12_QUERY_TYPE_OCCLUSION, queryIndex);
+        DepthQueryRecord q;
+        q.frame = frame; q.draw = drawSerial; q.source = ev.src; q.primitive = prim;
+        q.dsvPtr = (uint64_t)(uintptr_t)(dRT ? dRT->res.Get() : nullptr);
+        q.dsvGeneration = dRT ? dRT->resourceGeneration : 0;
+        q.priorClearCount = dRT ? dRT->clearCount : 0;
+        q.priorDepthWriteCount = dRT ? dRT->depthWriteCount : 0;
+        q.lastClearFrame = dRT ? dRT->lastClearFrame : 0;
+        q.lastClearDraw = dRT ? dRT->lastClearDraw : 0;
+        q.lastDepthWriteFrame = dRT ? dRT->lastDepthWriteFrame : 0;
+        q.lastDepthWriteDraw = dRT ? dRT->lastDepthWriteDraw : 0;
+        q.rtvPtr = (uint64_t)(uintptr_t)(cRT[0] ? cRT[0]->res.Get() : nullptr);
+        q.indices = ev.nIdx; q.issuedIndices = count;
+        q.zfunc = (uint32_t)dc.zfunc;
+        q.hostZfunc = (uint32_t)DepthFuncToHost(q.zfunc);
+        q.zEnable = dc.z_enable ? 1u : 0u; q.zWrite = dc.z_write_enable ? 1u : 0u;
+        q.dsvFormat = dRT ? dRT->xenosFormat : 0;
+        q.dsvDxgiFormat = dRT ? (uint32_t)dRT->format : 0;
+        q.dsvWidth = dRT ? dRT->w : 0; q.dsvHeight = dRT ? dRT->h : 0;
+        q.viewportX = vp.xy_offset[0]; q.viewportY = vp.xy_offset[1];
+        q.viewportWidth = vp.xy_extent[0]; q.viewportHeight = vp.xy_extent[1];
+        q.rtvWidth = cRT[0] ? cRT[0]->w : 0; q.rtvHeight = cRT[0] ? cRT[0]->h : 0;
+        q.viewportInDsv = viewportInDsv ? 1u : 0u;
+        q.scissorInDsv = scissorInDsv ? 1u : 0u;
+        q.targetsCompatible = targetsCompatible ? 1u : 0u;
+        q.depthClip = R<reg::PA_CL_CLIP_CNTL>().clip_disable ? 0u : 1u;
+        q.writesDepth = ps && ps->writesDepth ? 1u : 0u;
+        q.ndcZReversed = ndcZReversed ? 1u : 0u;
+        q.zMin = vp.z_min; q.zMax = vp.z_max;
+        q.ndcScaleZ = vp.ndc_scale[2]; q.ndcOffsetZ = vp.ndc_offset[2];
+        q.scissor[0] = r.left; q.scissor[1] = r.top; q.scissor[2] = r.right; q.scissor[3] = r.bottom;
+        q.scissorBound = (uint64_t)(r.right - r.left) * (uint64_t)(r.bottom - r.top);
+        depthQueryRecords.push_back(q);
+    }
+
+    // Diagnóstico por lectura directa de PhysHost: no repite el VS ni crea PSO.
+    static uint64_t guestInputDumpFrame = 0;
+    static uint32_t rectListSeen = 0;
+    if (guestInputDumpFrame != frame) {
+        guestInputDumpFrame = frame;
+        rectListSeen = 0;
+    }
+    const uint32_t vteValue = RV(0x2206);
+    const bool rectList3 = prim == 8 && ev.nIdx == 3 && vteValue == 0x300;
+    if (rt::gpu::Cfg().stateLog && rt::gpu::Cfg().stateLogFrame == frame && rectList3) {
+        const bool firstThree = rectListSeen < 3;
+        ++rectListSeen;
+        const bool alwaysClear = dc.z_enable && dc.z_write_enable && dc.zfunc == xenos::CompareFunction::kAlways;
+        if (firstThree || alwaysClear)
+            DumpGuestVertexInputs(*vs, frame, drawSerial, vteValue, ev.src,
+                                  RV(0x2102) & 0xFFFFFFu, 3);
+    }
+    if (dRT && prim == 8 && n == 3 && dc.z_enable && dc.z_write_enable &&
+        dc.zfunc == xenos::CompareFunction::kAlways && rt::gpu::Cfg().stateLog &&
+        rt::gpu::Cfg().stateLogFrame == frame) {
+        static uint64_t depthClearSnapshotFrame = 0;
+        static std::set<uint64_t> depthClearSnapshotBases;
+        if (depthClearSnapshotFrame != frame) { depthClearSnapshotFrame = frame; depthClearSnapshotBases.clear(); }
+        if (depthClearSnapshotBases.insert(depthBase).second)
+            DumpDepthSnapshot(*this, *dRT, depthBase, surf.surface_pitch, frame, drawSerial,
+                              (uint32_t)dc.zfunc, "post_always_clear");
+    }
+    if (dRT && dc.z_enable && dc.z_write_enable) {
+        ++dRT->depthWriteCount;
+        dRT->lastDepthWriteFrame = frame;
+        dRT->lastDepthWriteDraw = drawSerial;
+    }
+    // Capture the first relational draw that can update this DSV. Together
+    // with the pre-compare snapshot, this distinguishes a failed depth test
+    // from a viewport/depth-write problem without dumping every draw.
+    if (dRT && dc.z_enable && dc.z_write_enable && dc.zfunc != xenos::CompareFunction::kAlways &&
+        rt::gpu::Cfg().stateLog && rt::gpu::Cfg().stateLogFrame &&
+        rt::gpu::FrameCount() + 1 == rt::gpu::Cfg().stateLogFrame) {
+        static uint64_t depthPostDumpFrame = 0;
+        static std::set<uint64_t> depthPostDumped;
+        const uint64_t frame = rt::gpu::FrameCount() + 1;
+        if (depthPostDumpFrame != frame) {
+            depthPostDumpFrame = frame;
+            depthPostDumped.clear();
+        }
+        const uint64_t key = (uint64_t)depthBase | ((uint64_t)surf.surface_pitch << 12) | ((uint64_t)depthFormat << 32);
+        if (!depthPostDumped.count(key)) {
+            depthPostDumped.insert(key);
+            DumpDepthSnapshot(*this, *dRT, depthBase, surf.surface_pitch, frame, drawSerial,
+                              (uint32_t)dc.zfunc, "post_first_relational_write");
+        }
+    }
     if (const char* stopDbg = std::getenv("XE_DBG_STOP_AFTER_PS")) {
         const uint64_t debugFrame = rt::gpu::Cfg().stateLogFrame;
         if (ps && ps->hash == std::strtoull(stopDbg, nullptr, 16) && (!debugFrame || rt::gpu::FrameCount() + 1 == debugFrame)) {

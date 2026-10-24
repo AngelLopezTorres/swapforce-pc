@@ -549,6 +549,7 @@ void D3D12Backend::OnDraw(const DrawEvent& ev, const ShaderInfo* vs, const Shade
 
 void D3D12Backend::OnSwap(const backend::SwapInfo& s) {
     PERF_ZONE(kZoneSwapTotal);
+    FinishDepthQueries(s.frame);
     ViewerHarvest();   // M60: imagen pedida a la GPU en un fotograma anterior
     rt::gpu::g_syncReason = 13;
     if (g_strictResolveSync || !g_asyncResolveWriter) FlushResolves();   // M8 (ya vaciado en XE_SWAP); M60: solo con --strict-resolve-sync
