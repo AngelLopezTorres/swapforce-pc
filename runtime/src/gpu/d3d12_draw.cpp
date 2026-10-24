@@ -680,6 +680,18 @@ bool D3D12Backend::DoDraw(const DrawEvent& ev, const ShaderInfo* vs, const Shade
     int32_t sc[4];
     GetScissor(sc);
     uint32_t needH = std::min(((uint32_t)std::max(sc[3], 1) + 31u) & ~31u, 4096u);
+    // Alias de EDRAM: el juego limpia superficies con RectList en modo MSAA (p.ej. 4X con pitch/2) y luego dibuja a 1X sobre
+    // los mismos bytes de EDRAM (520x304 a 4X = 1040x608 a 1X). Sin EDRAM compartida, esa limpieza se redirige al RT 1X equivalente.
+    const bool clipOff = R<reg::PA_CL_CLIP_CNTL>().clip_disable;
+    const bool aliasClear = prim == 8 && clipOff && surf.msaa_samples != xenos::MsaaSamples::k1X && !std::getenv("XE_DBG_NOALIAS");
+    const uint32_t aliasX = aliasClear && surf.msaa_samples == xenos::MsaaSamples::k4X ? 2u : 1u;
+    const uint32_t aliasY = aliasClear ? 2u : 1u;
+    const uint32_t guestNeedH = needH;
+    const uint32_t surfPitch = surf.surface_pitch * aliasX;
+    if (aliasClear) {
+        needH = std::min(needH * aliasY, 4096u);
+        sc[0] *= (int32_t)aliasX; sc[2] *= (int32_t)aliasX; sc[1] *= (int32_t)aliasY; sc[3] *= (int32_t)aliasY;
+    }
     HostRT* cRT[4] = {nullptr, nullptr, nullptr, nullptr};
     uint32_t nrt = 0;
     if (colorMode) {
@@ -688,7 +700,7 @@ bool D3D12Backend::DoDraw(const DrawEvent& ev, const ShaderInfo* vs, const Shade
             auto ci = R<reg::RB_COLOR_INFO>(); ci.value = RV(i == 0 ? 0x2001 : 0x2003 + (i - 1));
             uint32_t mask = (RV(0x2104) >> (4 * i)) & 0xF;
             if (!mask) continue;
-            cRT[i] = GetColorRT(ci.color_base | (ci.color_base_bit_11 << 11), surf.surface_pitch, (uint32_t)ci.color_format, needH);
+            cRT[i] = GetColorRT(ci.color_base | (ci.color_base_bit_11 << 11), surfPitch, (uint32_t)ci.color_format, needH);
             if (!cRT[i]) { Note("OMISION draw: no se pudo crear el render target de color"); return false; }
             nrt = i + 1;
         }
@@ -704,7 +716,7 @@ bool D3D12Backend::DoDraw(const DrawEvent& ev, const ShaderInfo* vs, const Shade
         auto di = R<reg::RB_DEPTH_INFO>();
         depthBase = di.depth_base | (di.depth_base_bit_11 << 11);
         depthFormat = (uint32_t)di.depth_format;
-        dRT = GetDepthRT(depthBase, surf.surface_pitch, depthFormat, needH);
+        dRT = GetDepthRT(depthBase, surfPitch, depthFormat, needH);
         if (!dRT) { Note("OMISION draw: no se pudo crear el render target de profundidad"); return false; }
     }
     if (dRT && rt::gpu::Cfg().stateLog && rt::gpu::Cfg().stateLogFrame &&
@@ -736,7 +748,8 @@ bool D3D12Backend::DoDraw(const DrawEvent& ev, const ShaderInfo* vs, const Shade
     ViewportInfo vp;
     // clip_disable usa un viewport host que cubre el destino guest activo.
     // No se debe usar el limite global D3D12 como maximo guest de ambos ejes.
-    GetViewport(surf.surface_pitch, needH, vp, ps && ps->writesDepth);
+    GetViewport(surf.surface_pitch, aliasClear ? guestNeedH / aliasY : needH, vp, ps && ps->writesDepth);
+    if (aliasClear) { vp.xy_extent[0] = surfPitch; vp.xy_extent[1] = needH; }   // NDC en coordenadas guest (4X), viewport host sobre el RT 1X
     // Solo diagnóstico: indica si el shader transforma Z con signo negativo.
     // La función de comparación Xenos se mapea directamente a D3D12.
     const bool ndcZReversed = !(ps && ps->writesDepth) && vp.ndc_scale[2] < 0.0f;
