@@ -817,3 +817,12 @@ FFmpeg `n8.1.3-24-g92611900bb-20261023`, build BtbN `win64-lgpl-shared`: `https:
 ### Pendiente de ejecución final
 - `AGENTS.md` limita el Portal físico a un proceso a la vez y prohíbe detener procesos de otro propietario sin autorización. Se observaron instancias externas `SwapForceRT` (PID 23536, inicio 21:11:44; PID 45956, 21:12:44; PID 22096, 21:13:45 local); `Get-CimInstance` y `tasklist` devolvieron «Acceso denegado», por lo que su ruta/propietario es [NV]. El PID previo de la captura propia fue detenido; no se cerró ningún PID ajeno.
 - La prueba de 90 s con el código ya corregido y la sesión final en `http://127.0.0.1:8765/` quedan pendientes hasta que el Portal no esté ocupado. No se ejecutaron `git add`, `git commit` ni `git push`.
+
+## Fidelidad gráfica ronda 11 (2026-10-24; worktree `_wt_tex`, rama `tex-fidelity`)
+
+- Estado parcial: u3 reproduce el frame 20990 amarillo. Los datos medidos de sus resolves, texturas y límites de la inferencia están en `runtime/tex_runs/INFORME.md`.
+- No se ha cerrado causa raíz ni aplicado corrección gráfica. No se atribuyen el amarillo ni la raya de 16 filas a las simplificaciones de MSAA, D24FS8 o crecimiento de RT sin prueba causal.
+- `runtime/src/gpu/d3d12_draw.cpp`: añadido el registro `DRAWRASTER`, condicionado a `--gpu-statelog-frame`, para capturar los registros Xenos, viewport/scissor y tamaños de RT/DSV. Compilación `runtime/vb_tex.cmd`: salida 0; advertencia no fatal de `vswhere.exe` ausente.
+- `--imgcmp <referencia> <candidato>`: añadido en `runtime/src/main.cpp`; decodificación WIC RGBA8 en `runtime/src/util/image_io.{h,cpp}` y PSNR RGB de 8 bits (alpha excluido, dimensiones iguales; no aplica umbral). Basado en [Microsoft Learn: WIC decoder from filename](https://learn.microsoft.com/en-us/windows/win32/wic/-wic-decoder-howto-createusingfilename). Compilado, pendiente de ejecutar.
+- No se ejecutó la versión recién compilada: seguía activo el PID 18084 de `_wt_audio`; no se detuvo ni se lanzó otro runtime. La prueba anterior u5 de `--tex-verify`/`--resolve-verify` quedó en otra pantalla y no valida el frame amarillo.
+- `runtime/tools/regress/run_regress.ps1` no existe. Captura posterior, verificaciones sobre la escena afectada y sesión visor final pendientes.

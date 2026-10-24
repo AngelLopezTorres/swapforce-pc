@@ -2,7 +2,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <string>
+#include <vector>
 
 #include "config.h"
 #include "guest_memory.h"
@@ -23,6 +25,7 @@
 #include "hid/portal.h"
 #include "audio/xma_context.h"
 #include "kernel/xboxkrnl_sync.h"
+#include "util/image_io.h"
 
 namespace rt::gpu { int Pm4SelfTest(); extern bool g_fbSlowPath, g_fbVerify; }
 namespace rt::gpu::d3d { extern uint32_t g_dumpEveryMs, g_dumpFromS, g_dumpForS; }
@@ -257,6 +260,42 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+static int ImageCompare(const std::string& referencePath, const std::string& candidatePath) {
+    uint32_t rw = 0, rh = 0, cw = 0, ch = 0;
+    std::vector<uint8_t> reference, candidate;
+    if (!rt::ReadImageRGBA(referencePath, rw, rh, reference)) {
+        std::fprintf(stderr, "imgcmp: no se pudo decodificar %s\n", referencePath.c_str());
+        return 2;
+    }
+    if (!rt::ReadImageRGBA(candidatePath, cw, ch, candidate)) {
+        std::fprintf(stderr, "imgcmp: no se pudo decodificar %s\n", candidatePath.c_str());
+        return 2;
+    }
+    if (rw != cw || rh != ch) {
+        std::printf("imgcmp: dimensiones distintas ref=%ux%u candidato=%ux%u\n", rw, rh, cw, ch);
+        return 2;
+    }
+    const uint64_t pixels = (uint64_t)rw * rh;
+    double squaredError = 0.0;
+    uint64_t differentPixels = 0;
+    for (uint64_t i = 0; i < pixels; ++i) {
+        bool different = false;
+        for (uint32_t c = 0; c < 3; ++c) {
+            int d = (int)reference[i * 4 + c] - (int)candidate[i * 4 + c];
+            squaredError += (double)d * d;
+            different |= d != 0;
+        }
+        differentPixels += different;
+    }
+    double mse = squaredError / (double)(pixels * 3u);
+    if (mse == 0.0)
+        std::printf("imgcmp: %ux%u RGB MSE=0 PSNR=inf dB pixels_distintos=0/%llu\n", rw, rh, (unsigned long long)pixels);
+    else
+        std::printf("imgcmp: %ux%u RGB MSE=%.6f PSNR=%.4f dB pixels_distintos=%llu/%llu\n", rw, rh, mse,
+                    10.0 * std::log10(255.0 * 255.0 / mse), (unsigned long long)differentPixels, (unsigned long long)pixels);
+    return 0;
+}
+
 namespace rt { extern uint32_t g_guestLanguage; }
 int main(int argc, char** argv) {
     SetUnhandledExceptionFilter(CrashFilter);
@@ -270,6 +309,8 @@ int main(int argc, char** argv) {
     bool testUser0SignedIn = false;
     uint32_t testUser0SignedInAfterCalls = 0;
     uint64_t dumpHlslHash = 0;
+    std::string imageCompareReference, imageCompareCandidate;
+    bool imageCompare = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--max-imports") && i + 1 < argc) log.Config().maxImports = std::strtoull(argv[++i], nullptr, 0);
         else if (!std::strcmp(argv[i], "--log") && i + 1 < argc) logPath = argv[++i];
@@ -297,6 +338,10 @@ int main(int argc, char** argv) {
             if (!rt::hid::SetPortalState(argv[i] + 15)) { std::printf("--portal-state: valor no valido: %s\n", argv[i] + 15); return 2; }
         }
         else if (!std::strcmp(argv[i], "--selftest-xma")) xmaSelfTest = true;
+        else if (!std::strcmp(argv[i], "--imgcmp")) {
+            if (i + 2 >= argc) { std::fprintf(stderr, "uso: SwapForceRT --headless --imgcmp <referencia> <candidato>\n"); return 2; }
+            imageCompare = true; imageCompareReference = argv[++i]; imageCompareCandidate = argv[++i];
+        }
         else if (!std::strcmp(argv[i], "--gpu-regdump")) rt::gpu::Cfg().regDump = true;
         else if (!std::strcmp(argv[i], "--gpu-log") && i + 1 < argc) rt::gpu::Cfg().logPath = argv[++i];
         else if (!std::strcmp(argv[i], "--gpu-statelog")) rt::gpu::Cfg().stateLog = true;
@@ -390,6 +435,7 @@ int main(int argc, char** argv) {
             return ok ? 0 : 1;
         }
     }
+    if (imageCompare) return ImageCompare(imageCompareReference, imageCompareCandidate);
     if (!log.Open(logPath)) { std::fprintf(stderr, "no se puede abrir %s\n", logPath.c_str()); return 2; }
     {   // sesion por el visor (localhost): sin sonido por defecto; --audio=wasapi lo activa
         bool viewer = false, audioGiven = false;

@@ -669,6 +669,27 @@ bool D3D12Backend::DoDraw(const DrawEvent& ev, const ShaderInfo* vs, const Shade
     uint32_t rtw = cRT[0] ? cRT[0]->w : (dRT ? dRT->w : surf.surface_pitch), rth = cRT[0] ? cRT[0]->h : (dRT ? dRT->h : 1024);
     D3D12_RECT r = {sc[0], sc[1], std::min<int32_t>(sc[2], (int32_t)rtw), std::min<int32_t>(sc[3], (int32_t)rth)};
     if (r.right <= r.left || r.bottom <= r.top) return true;     // scissor vacio
+    const bool rasterLog = rt::gpu::Cfg().stateLog;
+    const uint64_t stateFrame = rasterLog ? rt::gpu::FrameCount() + 1 : 0;
+    if (rasterLog && (!rt::gpu::Cfg().stateLogFrame || stateFrame == rt::gpu::Cfg().stateLogFrame)) {
+        char b[1024];
+        const HostRT* c0 = cRT[0];
+        std::snprintf(b, sizeof(b),
+                      "DRAWRASTER frame=%llu draw=%llu raw(surface=%08X color=%08X depth=%08X depthctl=%08X clip=%08X scmode=%08X vte=%08X "
+                      "win=(%08X,%08X,%08X) screen=(%08X,%08X) vreg=(%08X,%08X,%08X,%08X,%08X,%08X)) "
+                      "scissor=(%d,%d)-(%d,%d) host=(%ld,%ld)-(%ld,%ld) viewport=(%u,%u %ux%u z=%.6g..%.6g) "
+                      "rt=%08X pitch=%u fmt=%u %ux%u msaa=%u dsv=%08X fmt=%u pitch=%u %ux%u",
+                      (unsigned long long)stateFrame, (unsigned long long)drawSerial,
+                      RV(0x2000), RV(0x2001), RV(0x2002), RV(0x2200), RV(0x2204), RV(0x2205), RV(0x2206),
+                      RV(0x2080), RV(0x2081), RV(0x2082), RV(0x200E), RV(0x200F),
+                      RV(0x210F), RV(0x2110), RV(0x2111), RV(0x2112), RV(0x2113), RV(0x2114),
+                      sc[0], sc[1], sc[2], sc[3], r.left, r.top, r.right, r.bottom,
+                      vp.xy_offset[0], vp.xy_offset[1], vp.xy_extent[0], vp.xy_extent[1], vp.z_min, vp.z_max,
+                      c0 ? (RV(0x2001) & 0xFFFu) : 0u, surf.surface_pitch, c0 ? c0->xenosFormat : 0u,
+                      c0 ? c0->w : 0u, c0 ? c0->h : 0u, (uint32_t)surf.msaa_samples,
+                      RV(0x2002), dRT ? dRT->xenosFormat : 0u, surf.surface_pitch, dRT ? dRT->w : 0u, dRT ? dRT->h : 0u);
+        ImportLog::Get().Printf("D3D12 %s", b);
+    }
     cl->RSSetScissorRects(1, &r);
     float bf[4] = {RF(0x2105), RF(0x2106), RF(0x2107), RF(0x2108)};
     cl->OMSetBlendFactor(bf);

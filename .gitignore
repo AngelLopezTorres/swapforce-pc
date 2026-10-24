@@ -86,3 +86,8 @@ runtime/build_audio/
 runtime/vb_audio.cmd
 runtime/audio_runs/
 iso_extract_es_it/
+
+_cap_ref/
+runtime/build_tex/
+runtime/tex_runs/
+runtime/vb_tex.cmd

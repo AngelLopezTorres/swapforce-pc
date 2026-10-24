@@ -4,6 +4,7 @@
 #include <wincodec.h>
 
 #include <algorithm>
+#include <limits>
 #include <vector>
 
 #pragma comment(lib, "windowscodecs.lib")
@@ -123,6 +124,45 @@ bool EncodeJpegRGBA(uint32_t w, uint32_t h, const uint8_t* rgba, uint32_t stride
     if (f) f->Release();
     if (coInit) CoUninitialize();
     if (!ok) out.clear();
+    return ok;
+}
+
+bool ReadImageRGBA(const std::string& path, uint32_t& w, uint32_t& h, std::vector<uint8_t>& rgba) {
+    w = h = 0;
+    rgba.clear();
+    int chars = MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, nullptr, 0);
+    if (!chars) return false;
+    std::vector<WCHAR> widePath((size_t)chars);
+    if (!MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, widePath.data(), chars)) return false;
+
+    HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    bool coInit = SUCCEEDED(co);
+    if (FAILED(co) && co != RPC_E_CHANGED_MODE) return false;
+    IWICImagingFactory* f = nullptr;
+    IWICBitmapDecoder* dec = nullptr;
+    IWICBitmapFrameDecode* frame = nullptr;
+    IWICFormatConverter* cv = nullptr;
+    bool ok = false;
+    do {
+        if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&f)))) break;
+        // WIC decoder/converter: Microsoft Learn, https://learn.microsoft.com/en-us/windows/win32/wic/-wic-decoder-howto-createusingfilename
+        if (FAILED(f->CreateDecoderFromFilename(widePath.data(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec))) break;
+        if (FAILED(dec->GetFrame(0, &frame)) || FAILED(f->CreateFormatConverter(&cv))) break;
+        if (FAILED(cv->Initialize(frame, GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom))) break;
+        UINT iw = 0, ih = 0;
+        if (FAILED(cv->GetSize(&iw, &ih)) || !iw || !ih || iw > std::numeric_limits<UINT>::max() / 4u) break;
+        uint64_t bytes = (uint64_t)iw * ih * 4u;
+        if (bytes > std::numeric_limits<UINT>::max() || bytes > (uint64_t)std::numeric_limits<size_t>::max()) break;
+        rgba.resize((size_t)bytes);
+        if (FAILED(cv->CopyPixels(nullptr, iw * 4u, (UINT)bytes, rgba.data()))) { rgba.clear(); break; }
+        w = iw; h = ih; ok = true;
+    } while (false);
+    if (cv) cv->Release();
+    if (frame) frame->Release();
+    if (dec) dec->Release();
+    if (f) f->Release();
+    if (coInit) CoUninitialize();
+    if (!ok) { w = h = 0; rgba.clear(); }
     return ok;
 }
 
