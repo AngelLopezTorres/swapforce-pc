@@ -260,6 +260,9 @@ ID3D12PipelineState* D3D12Backend::GetPso(const ShaderInfo& vsI, const ShaderInf
     bool stencilOn = depth.stencil_enable != 0;
     if (!colorMode && edramMode != xenos::EdramMode::kDepthOnly) { depthOn = false; stencilOn = false; }
     if (st.dsvFmt == 0) { depthOn = false; stencilOn = false; }
+    static const bool dbgNoDepth = std::getenv("XE_DBG_NODEPTH") != nullptr, dbgNoCull = std::getenv("XE_DBG_NOCULL") != nullptr;   // experimentos de diagnostico
+    if (dbgNoDepth) { depthOn = false; stencilOn = false; }
+    if (dbgNoCull) d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     if (depthOn) {
         d.DepthStencilState.DepthEnable = TRUE;
         d.DepthStencilState.DepthWriteMask = depth.z_write_enable ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
@@ -267,7 +270,10 @@ ID3D12PipelineState* D3D12Backend::GetPso(const ShaderInfo& vsI, const ShaderInf
         // En esta ruta de viewport/EDRAM, invertir la comparacion Z reproduce
         // la profundidad del titulo; la causa general aun no esta verificada.
         auto& f = d.DepthStencilState.DepthFunc;
-        if (f == D3D12_COMPARISON_FUNC_GREATER_EQUAL) f = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+        static const int dbgInv = std::getenv("XE_DBG_INV") ? std::atoi(std::getenv("XE_DBG_INV")) : 3;   // bit0: invertir en D24, bit1: invertir en D32F
+        const bool isF32 = st.dsvFmt != (uint32_t)DXGI_FORMAT_D24_UNORM_S8_UINT;
+        if (!((dbgInv >> (isF32 ? 1 : 0)) & 1)) {}
+        else if (f == D3D12_COMPARISON_FUNC_GREATER_EQUAL) f = D3D12_COMPARISON_FUNC_LESS_EQUAL;
         else if (f == D3D12_COMPARISON_FUNC_GREATER) f = D3D12_COMPARISON_FUNC_LESS;
         else if (f == D3D12_COMPARISON_FUNC_LESS_EQUAL) f = D3D12_COMPARISON_FUNC_GREATER_EQUAL;
         else if (f == D3D12_COMPARISON_FUNC_LESS) f = D3D12_COMPARISON_FUNC_GREATER;
@@ -665,6 +671,10 @@ bool D3D12Backend::DoDraw(const DrawEvent& ev, const ShaderInfo* vs, const Shade
     cl->SetGraphicsRootDescriptorTable(3, g2);
     cl->IASetPrimitiveTopology(topo);
     D3D12_VIEWPORT v = {(float)vp.xy_offset[0], (float)vp.xy_offset[1], (float)vp.xy_extent[0], (float)vp.xy_extent[1], vp.z_min, vp.z_max};
+    if (rt::gpu::Cfg().stateLog && rt::gpu::Cfg().stateLogFrame && rt::gpu::FrameCount() + 1 == rt::gpu::Cfg().stateLogFrame) {
+        auto zc = R<reg::RB_DEPTHCONTROL>();
+        ImportLog::Get().Printf("D3D12 ZSTATE frame=%llu draw=%llu zfunc=%u zen=%u zwr=%u zmin=%g zmax=%g nz=(%g,%g) clipdis=%u dxclip=%u dfmt=%u vte=%08X", (unsigned long long)(rt::gpu::FrameCount() + 1), (unsigned long long)ev.src, (unsigned)zc.zfunc, (unsigned)zc.z_enable, (unsigned)zc.z_write_enable, vp.z_min, vp.z_max, vp.ndc_scale[2], vp.ndc_offset[2], (unsigned)R<reg::PA_CL_CLIP_CNTL>().clip_disable, (unsigned)R<reg::PA_CL_CLIP_CNTL>().dx_clip_space_def, dRT ? dRT->xenosFormat : 99u, RV(0x2206));
+    }
     cl->RSSetViewports(1, &v);
     uint32_t rtw = cRT[0] ? cRT[0]->w : (dRT ? dRT->w : surf.surface_pitch), rth = cRT[0] ? cRT[0]->h : (dRT ? dRT->h : 1024);
     D3D12_RECT r = {sc[0], sc[1], std::min<int32_t>(sc[2], (int32_t)rtw), std::min<int32_t>(sc[3], (int32_t)rth)};

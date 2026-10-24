@@ -56,7 +56,8 @@ HostRT* D3D12Backend::GetColorRT(uint32_t base, uint32_t pitch, uint32_t fmt, ui
     }
     if (R<reg::RB_SURFACE_INFO>().msaa_samples != xenos::MsaaSamples::k1X) Note("SIMPLIFY MSAA tratado como 1X");
     uint32_t w = std::min(std::max(pitch, 16u), 8192u);
-    uint32_t h = std::min(std::max(needH, 1024u), 8192u);
+    static const uint32_t dbgRtH = std::getenv("XE_DBG_RTH") ? (uint32_t)std::atoi(std::getenv("XE_DBG_RTH")) : 0;   // experimento: altura fija de RT para no recrearlos (se pierde el contenido)
+    uint32_t h = std::min(std::max(std::max(needH, 1024u), dbgRtH), 8192u);
     auto it = colorRTs.find(key);
     if (it != colorRTs.end()) {
         HostRT& rt = it->second;
@@ -95,7 +96,8 @@ HostRT* D3D12Backend::GetDepthRT(uint32_t base, uint32_t pitch, uint32_t fmt, ui
     DXGI_FORMAT df = fmt == 0 ? DXGI_FORMAT_D24_UNORM_S8_UINT : DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
     if (fmt != 0) Note("SIMPLIFY profundidad D24FS8 (float de 20e4) aproximada por D32_FLOAT");
     uint32_t w = std::min(std::max(pitch, 16u), 8192u);
-    uint32_t h = std::min(std::max(needH, 1024u), 8192u);
+    static const uint32_t dbgRtH = std::getenv("XE_DBG_RTH") ? (uint32_t)std::atoi(std::getenv("XE_DBG_RTH")) : 0;   // experimento: altura fija de RT para no recrearlos (se pierde el contenido)
+    uint32_t h = std::min(std::max(std::max(needH, 1024u), dbgRtH), 8192u);
     auto it = depthRTs.find(key);
     if (it != depthRTs.end()) {
         HostRT& rt = it->second;
@@ -496,6 +498,7 @@ bool D3D12Backend::DoResolve(const DrawEvent& ev) {
             uint32_t cv = RV(0x231D);
             uint32_t d24 = (cv >> 8) & 0xFFFFFF;
             float dv = d->xenosFormat == 0 ? xenos::UNorm24To32(d24) : xenos::Float20e4To32(d24) * 0.5f;
+            { static uint64_t dcl = 0; if (dcl < 400) { ++dcl; ImportLog::Get().Printf("D3D12 DEPTHCLEAR frame=%llu base=%u dfmt=%u cv=%08X d24=%06X host=%g region=(%d,%d)-(%d,%d)", (unsigned long long)FrameCount(), (unsigned)(di.depth_base | (di.depth_base_bit_11 << 11)), (unsigned)di.depth_format, cv, d24, dv, x0, y0, x1, y1); } }
             Transition(d->res.Get(), d->state, D3D12_RESOURCE_STATE_DEPTH_WRITE); d->state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
             D3D12_CPU_DESCRIPTOR_HANDLE hd = dsvHeap->GetCPUDescriptorHandleForHeapStart();
             hd.ptr += (SIZE_T)d->viewIdx * dsvInc;

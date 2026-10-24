@@ -9,7 +9,10 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <array>
 #include <deque>
+#include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -273,6 +276,7 @@ namespace {
 
 PortalWriteMode g_writeModeSetting = PortalWriteMode::Auto;   // --portal-write
 bool g_coalesceS = true;   // --portal-queue=coalesce|fifo: descarta informes 'S' antiguos pendientes al llegar otro 'S'
+std::string g_replayPath;   // --portal-replay <registro>: Portal VIRTUAL (solo software) que reproduce respuestas grabadas
 PortalXlate g_xlate = PortalXlate::StripHdr;                      // --portal-xlate (defecto provisional; ver PROGRESS.md)
 enum class PortalStateMode { Raw, Stable };
 PortalStateMode g_stateMode = PortalStateMode::Stable;   // --portal-state=raw|stable
@@ -481,7 +485,89 @@ private:
         reports_.push_back(queued);
     }
 
+    // ---- Portal virtual (--portal-replay): sin USB. Responde a las ordenes R/A/Q del juego con las respuestas que el
+    // Portal fisico dio en un registro anterior (lineas "PORTAL USB dir=IN ... data[32]=") y emite estados 'S'
+    // (ausente -> llegada -> presente). No escribe nada en ningun dispositivo. ----
+    static bool HexLine(const std::string& line, const char* tag, uint8_t* out, uint32_t& n) {
+        size_t p = line.find(tag);
+        if (p == std::string::npos) return false;
+        p += std::strlen(tag);
+        n = 0;
+        while (p + 1 < line.size() && n < kPortalReportSize && std::isxdigit((unsigned char)line[p]) && std::isxdigit((unsigned char)line[p + 1])) {
+            out[n++] = (uint8_t)std::stoul(line.substr(p, 2), nullptr, 16);
+            p += 2;
+        }
+        return n > 0;
+    }
+
+    void DeliverBuf(const uint8_t* buf, uint32_t n) {
+        PortalPacket p;
+        p.len = n; p.type = buf[0];
+        std::memcpy(p.data, buf, n);
+        if (g_xlate == PortalXlate::StripHdr) {
+            uint8_t t[kPortalReportSize]{};
+            t[0] = 0x0B; t[1] = 0x14;
+            std::memcpy(t + 2, buf, std::min<uint32_t>(n, kPortalReportSize - 2));
+            p.len = std::min<uint32_t>(n + 2, kPortalReportSize);
+            std::memcpy(p.data, t, kPortalReportSize);
+        }
+        PushReport(p);
+    }
+
+    void RunVirtual() {
+        std::map<std::string, std::array<uint8_t, kPortalReportSize>> resp;
+        uint8_t sPresent[kPortalReportSize]{};
+        bool haveS = false;
+        std::ifstream f(g_replayPath);
+        std::string line;
+        std::string pendKey;   // clave de la ultima orden R/A/Q emitida por el juego, a la espera de su respuesta
+        uint8_t pendType = 0;
+        while (std::getline(f, line)) {
+            const bool isOut = line.find("PORTAL USB dir=OUT") != std::string::npos;
+            if (!isOut && line.find("PORTAL USB dir=IN") == std::string::npos) continue;
+            uint8_t b[kPortalReportSize]{}; uint32_t n = 0;
+            if (!HexLine(line, "data[32]=", b, n) || n < 2) continue;
+            if (isOut) {
+                if (b[0] == 0x52 || b[0] == 0x41 || b[0] == 0x51) { pendType = b[0]; pendKey.assign((const char*)b, b[0] == 0x51 ? 3 : (b[0] == 0x52 ? 1 : 2)); }
+                continue;
+            }
+            if (b[0] == 0x53) { if (!haveS && (b[1] & 1)) { std::memcpy(sPresent, b, n); haveS = true; } continue; }
+            if (pendType && b[0] == pendType && !pendKey.empty()) {      // la respuesta se asocia a la orden pendiente (la de Q puede cambiar el byte de ranura)
+                if (!resp.count(pendKey)) { std::array<uint8_t, kPortalReportSize> a{}; std::memcpy(a.data(), b, n); resp[pendKey] = a; }
+                pendKey.clear(); pendType = 0;
+            }
+        }
+        ImportLog::Get().Printf("PORTAL VIRTUAL registro=%s respuestas=%zu estado_presente=%s", g_replayPath.c_str(), resp.size(), haveS ? "si" : "no");
+        if (!haveS) for (;;) Sleep(1000);
+        connected = true;
+        const DWORD t0 = GetTickCount();
+        uint32_t counter = 0, arrival = 0;
+        for (;;) {
+            PortalPacket w;
+            while (PopWrite(w)) {
+                const uint8_t t = w.data[0];
+                if (t == 0x41 && w.data[1] <= 1) arrival = 3;      // 'A' (activar): el Portal real responde con 53 03 (presente + cambiado)
+                if (t != 0x52 && t != 0x41 && t != 0x51) continue;       // C (color), S y el resto: sin respuesta
+                std::string key((const char*)w.data, t == 0x51 ? 3 : (t == 0x52 ? 1 : 2));
+                auto it = resp.find(key);
+                if (it != resp.end()) DeliverBuf(it->second.data(), kPortalReportSize);
+                else ImportLog::Get().Printf("PORTAL VIRTUAL sin respuesta grabada para orden %02X %02X %02X", t, w.data[1], w.data[2]);
+            }
+            const DWORD age = GetTickCount() - t0;
+            uint8_t s[kPortalReportSize]{};
+            std::memcpy(s, sPresent, sizeof(s));
+            s[5] = (uint8_t)(0x80 + (counter++ & 0x3F));
+            if (age < 4000) s[1] = 0x00;                                  // ausente
+            else if (age < 4050) s[1] = 0x03;                            // llegada (presente + cambiado)
+            else if (arrival) { s[1] = 0x03; --arrival; }                // llegada tras activar
+            else s[1] = 0x01;                                            // presente
+            DeliverBuf(s, kPortalReportSize);
+            Sleep(4);
+        }
+    }
+
     void Run() {
+        if (!g_replayPath.empty()) { RunVirtual(); return; }
         if (!api_.Load()) {
             ImportLog::Get().Printf("PORTAL USB libusbK.dll o exportaciones no disponibles; Portal desconectado");
             for (;;) Sleep(1000);
@@ -745,6 +831,12 @@ bool SetPortalQueue(const char* text) {
     if (!std::strcmp(text, "coalesce")) g_coalesceS = true;
     else if (!std::strcmp(text, "fifo")) g_coalesceS = false;
     else return false;
+    return true;
+}
+
+bool SetPortalReplay(const char* path) {
+    if (!path || !*path) return false;
+    g_replayPath = path;
     return true;
 }
 
