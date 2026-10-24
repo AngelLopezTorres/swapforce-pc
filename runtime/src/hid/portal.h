@@ -49,6 +49,10 @@ bool SetPortalQueue(const char* text);
 // Stable elimina el bit "cambiado" cuando el informe conserva presencia y posición.
 bool SetPortalState(const char* text);   // "raw" | "stable"
 
+// Portal VIRTUAL (solo software, sin USB): reproduce las respuestas R/A/Q grabadas en un registro de ejecucion previa
+// (lineas "PORTAL USB dir=IN"). Permite probar el juego sin ocupar el Portal fisico.
+bool SetPortalReplay(const char* path);
+
 bool ProbePortal(PortalProbeResult& result);
 bool PortalProbeAccepted(const PortalProbeResult& result);
 

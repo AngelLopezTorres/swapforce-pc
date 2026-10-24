@@ -328,6 +328,7 @@ int main(int argc, char** argv) {
         else if (!std::strncmp(argv[i], "--portal-write=", 15)) {   // auto|interrupt|control|control-pad32 (portal.h)
             if (!rt::hid::SetPortalWriteMode(argv[i] + 15)) { std::printf("--portal-write: valor no valido: %s\n", argv[i] + 15); return 2; }
         }
+        else if (!std::strcmp(argv[i], "--portal-replay") && i + 1 < argc) { if (!rt::hid::SetPortalReplay(argv[++i])) return 2; }
         else if (!std::strncmp(argv[i], "--portal-xlate=", 15)) {   // none|strip|strip-hdr|strip-hdrlen (portal.h)
             if (!rt::hid::SetPortalXlate(argv[i] + 15)) { std::printf("--portal-xlate: valor no valido: %s\n", argv[i] + 15); return 2; }
         }

@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "import_log.h"
+#include "gpu/gpu.h"
 #include "util/image_io.h"
 
 #pragma comment(lib, "ws2_32.lib")
@@ -241,6 +242,14 @@ void HandleClient(SOCKET s) {
         if (!ParseKeys(query, mask)) { SendSimple(s, 400, "Bad Request"); return; }
         g_buttons = mask;
         g_buttonStamp = NowMs();
+        SendSimple(s, 204, "No Content");
+        return;
+    }
+    if (path == "/statelog") {   // diagnostico: registra el estado detallado de los draws del fotograma en curso+2 (requiere --viewer-input y --gpu-log)
+        if (!g_opt.input) { SendSimple(s, 404, "Not Found"); return; }
+        rt::gpu::Cfg().stateLog = true;
+        rt::gpu::Cfg().stateLogFrame = rt::gpu::FrameCount() + 2;
+        rt::gpu::Cfg().dumpResolveFrame = rt::gpu::FrameCount() + 2;
         SendSimple(s, 204, "No Content");
         return;
     }
