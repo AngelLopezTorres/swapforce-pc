@@ -641,7 +641,18 @@ void EnableReadPointerWriteBack(uint32_t phys, uint32_t blockLog2) {
     ImportLog::Get().Printf("GPU: EnableReadPointerWriteBack phys=%08X block_log2=%u", phys, blockLog2);
 }
 
-void RecordSwapCall() { ++g_swapCalls; M60Event('V'); }
+void RecordSwapCall() {
+    const uint64_t swap = ++g_swapCalls;
+    M60Event('V');
+    if (perf::g_enabled) {
+        static uint64_t last = 0;
+        static const double frequency = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return double(f.QuadPart); }();
+        const uint64_t now = perf::Now();
+        ImportLog::Get().Printf("PERF VDSWAP swap=%llu qpc=%llu dt_ms=%.3f", (unsigned long long)swap,
+                               (unsigned long long)now, last ? (now - last) * 1000.0 / frequency : 0.0);
+        last = now;
+    }
+}
 std::atomic<uint64_t> g_swapMarkQueued{0}, g_swapMarkDone{0};
 // M60 diagnostico: V = VdSwap del juego, B = VBLANK (a = numero), S = XE_SWAP en el CP, I = interrupcion de volteo,
 // F/f = inicio/fin de FlushResolves con espera, K/k = FlushAndWait, L = lote del anillo

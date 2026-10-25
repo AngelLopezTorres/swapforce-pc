@@ -303,13 +303,45 @@ ID3D12PipelineState* D3D12Backend::GetPso(const ShaderInfo& vsI, const ShaderInf
         }
     }
     ComPtr<ID3D12PipelineState> pso;
+    // Cache local, versionada por traductor y esquema del pipeline. El controlador
+    // valida el blob; cualquier incompatibilidad vuelve a la creacion normal.
+    // Experimental hasta completar la aceptacion del juego; activar con
+    // XE_PSO_DISK_CACHE=1. Incrementar v1 al cambiar la raiz o la generacion del PSO.
+    static const bool diskPsoCache = [] { const char* v = std::getenv("XE_PSO_DISK_CACHE"); return v && std::strcmp(v, "1") == 0; }();
+    const std::string psoDir = GetPaths().userdataDir + "\\shaders\\pso";
+    if (diskPsoCache) CreateDirectoryA(psoDir.c_str(), nullptr);
+    char psoName[192];
+    std::snprintf(psoName, sizeof(psoName), "\\%s_v1_%016llX.pso", kTranslatorVersion, (unsigned long long)hkey);
+    const std::string psoPath = psoDir + psoName;
+    std::string cachedPso;
+    const bool cacheRead = diskPsoCache && ReadAll(psoPath, cachedPso) && cachedPso.size() > key.size() &&
+                           !std::memcmp(cachedPso.data(), key.data(), key.size());
+    if (cacheRead) d.CachedPSO = {cachedPso.data() + key.size(), cachedPso.size() - key.size()};
+    const uint64_t psoStart = perf::g_enabled ? perf::Now() : 0;
     HRESULT hr = dev->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso));
+    bool cacheHit = cacheRead && SUCCEEDED(hr);
+    if (FAILED(hr) && cacheRead) {
+        ImportLog::Get().Printf("D3D12 PSO_CACHE_REJECT key=%016llX hr=%08X", (unsigned long long)hkey, (unsigned)hr);
+        d.CachedPSO = {};
+        pso.Reset();
+        hr = dev->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso));
+    }
+    if (perf::g_enabled) {
+        LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+        ImportLog::Get().Printf("PERF PSO_CREATE key=%016llX cached=%d ok=%d ms=%.3f", (unsigned long long)hkey,
+                               cacheHit ? 1 : 0, SUCCEEDED(hr) ? 1 : 0, (perf::Now() - psoStart) * 1000.0 / f.QuadPart);
+    }
     if (FAILED(hr)) {
         ++psoFail; ++fPsoFail;
         ImportLog::Get().Printf("D3D12 PSO_FAIL hr=0x%08X vs=%016llX ps=%016llX nrt=%u rt0=%u dsv=%u topo=%u rectgs=%d", (unsigned)hr, (unsigned long long)st.vs,
                                 (unsigned long long)st.ps, d.NumRenderTargets, st.rtFmt[0], st.dsvFmt, topoClass, (int)rectGs);
         psoCache[key] = nullptr;
         return nullptr;
+    }
+    if (diskPsoCache && !cacheHit) {
+        ComPtr<ID3DBlob> blob;
+        if (SUCCEEDED(pso->GetCachedBlob(&blob)))
+            WriteAll(psoPath, key + std::string((const char*)blob->GetBufferPointer(), blob->GetBufferSize()));
     }
     ID3D12PipelineState* raw = pso.Get();
     psoCache[key] = pso;
@@ -706,7 +738,13 @@ bool D3D12Backend::DoDraw(const DrawEvent& ev, const ShaderInfo* vs, const Shade
         }
         // huecos (RT intermedios sin escribir): se rellenan con el RT correspondiente si existe, si no no se soporta
         for (uint32_t i = 0; i < nrt; ++i)
-            if (!cRT[i]) { Note("OMISION draw: RT de color con huecos"); return false; }
+            if (!cRT[i]) {
+                if (rt::gpu::Cfg().stateLogFrame == rt::gpu::FrameCount() + 1)
+                    ImportLog::Get().Printf("RT_GAP frame=%llu draw=%llu ps=%016llX writes=%X mask=%X slot=%u",
+                        (unsigned long long)(rt::gpu::FrameCount() + 1), (unsigned long long)drawSerial,
+                        (unsigned long long)ps->hash, ps->writesColors, RV(0x2104), i);
+                Note("OMISION draw: RT de color con huecos"); return false;
+            }
     }
     auto dc = R<reg::RB_DEPTHCONTROL>();
     bool depthUsed = (dc.z_enable && !(dc.zfunc == xenos::CompareFunction::kAlways && !dc.z_write_enable)) || dc.stencil_enable;
@@ -1131,7 +1169,7 @@ bool D3D12Backend::DoDraw(const DrawEvent& ev, const ShaderInfo* vs, const Shade
         const bool firstThree = rectListSeen < 3;
         ++rectListSeen;
         const bool alwaysClear = dc.z_enable && dc.z_write_enable && dc.zfunc == xenos::CompareFunction::kAlways;
-        if (firstThree || alwaysClear)
+        if (firstThree || alwaysClear || (colorMode && nrt && clipOff && ps && !ps->tfetchMask))
             DumpGuestVertexInputs(*vs, frame, drawSerial, vteValue, ev.src,
                                   RV(0x2102) & 0xFFFFFFu, 3);
     }

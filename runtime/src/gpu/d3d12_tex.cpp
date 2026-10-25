@@ -279,7 +279,33 @@ HostTexture* D3D12Backend::GetTexture(uint32_t idx, bool vertexStage) {
     if (dimension == 2 || depth > 1) { ++texFail; ++fTexFail; Note("OMISION textura 3D/apilada no soportada"); return nullptr; }
     if (width > 8192 || height > 8192 || !width || !height) { ++texFail; ++fTexFail; Note("OMISION textura con dimensiones invalidas"); return nullptr; }
     uint32_t baseAddr = (uint32_t)tf.base_address << 12;
+    // Volcado acotado a los fotogramas StateLog; una copia por descriptor.
+    static uint64_t dumpFrame = 0;
+    static std::set<uint64_t> dumpedDescriptors;
+    const uint64_t frame = rt::gpu::FrameCount() + 1;
+    if (dumpFrame != frame) { dumpFrame = frame; dumpedDescriptors.clear(); }
+    const uint64_t descriptorHash = Fnv(reinterpret_cast<const uint8_t*>(w6), sizeof(w6));
+    const bool stateDump = opt.dumpTextures && rt::gpu::Cfg().stateLog &&
+        rt::gpu::Cfg().stateLogFrame == frame && dumpedDescriptors.insert(descriptorHash).second;
+    if (stateDump) ImportLog::Get().Printf("TEX19 frame=%llu draw=%llu fetch=%u base=%08X fmt=%u size=%ux%u tiled=%u endian=%u pitch=%u swizzle=%03X signs=%u,%u,%u,%u mip=%u..%u mipbase=%08X packed=%u exp=%d",
+        (unsigned long long)frame, (unsigned long long)drawSerial, idx, baseAddr, fmtId, width, height,
+        (unsigned)tf.tiled, (unsigned)tf.endianness, (unsigned)tf.pitch * 32, (unsigned)tf.swizzle,
+        (unsigned)tf.sign_x, (unsigned)tf.sign_y, (unsigned)tf.sign_z, (unsigned)tf.sign_w,
+        (unsigned)tf.mip_min_level, (unsigned)tf.mip_max_level, (unsigned)tf.mip_address << 12,
+        (unsigned)tf.packed_mips, (int)tf.exp_adjust);
     uint32_t bw = fi.bw, bh = fi.bh;
+    // Xenia TextureInfo::GetMipLocation(0) / GetPackedTileOffset(0):
+    // el nivel base tambien esta desplazado si una dimension cabe en 16 texeles.
+    uint32_t baseBlockX = 0, baseBlockY = 0;
+    if (tf.packed_mips && std::min(width, height) <= 16) {
+        auto ceilLog2 = [](uint32_t v) { uint32_t l = 0; for (uint32_t p = 1; p < v; p <<= 1) ++l; return l; };
+        if (ceilLog2(width) > ceilLog2(height)) baseBlockY = 16 / bh;
+        else baseBlockX = 16 / bw;
+    }
+    if (stateDump) ImportLog::Get().Printf("TEX19_OFFSET frame=%llu draw=%llu base=%08X blocks=%u,%u block_size=%ux%u",
+        (unsigned long long)frame, (unsigned long long)drawSerial, baseAddr, baseBlockX, baseBlockY, bw, bh);
+    if (tf.mip_max_level && tf.mip_address)
+        Note("SIMPLIFY textura: solo nivel base; niveles mip adicionales no cargados");
     uint32_t wBlocks = (width + bw - 1) / bw, hBlocks = (height + bh - 1) / bh;
     uint32_t pitchPx = (uint32_t)tf.pitch * 32;
     if (!pitchPx) pitchPx = (width + 31) & ~31u;
@@ -299,10 +325,10 @@ HostTexture* D3D12Backend::GetTexture(uint32_t idx, bool vertexStage) {
     if (tiled) {
         int64_t maxOff = 0;
         for (uint32_t bx = 0; bx < wBlocks; bx += std::max(1u, wBlocks / 64))
-            maxOff = std::max<int64_t>(maxOff, xe::gpu::texture_address::Tiled2D((int32_t)bx, (int32_t)hBlocks - 1, pitchAligned, bpbLog2));
-        maxOff = std::max<int64_t>(maxOff, xe::gpu::texture_address::Tiled2D((int32_t)wBlocks - 1, (int32_t)hBlocks - 1, pitchAligned, bpbLog2));
+            maxOff = std::max<int64_t>(maxOff, xe::gpu::texture_address::Tiled2D((int32_t)(baseBlockX + bx), (int32_t)(baseBlockY + hBlocks - 1), pitchAligned, bpbLog2));
+        maxOff = std::max<int64_t>(maxOff, xe::gpu::texture_address::Tiled2D((int32_t)(baseBlockX + wBlocks - 1), (int32_t)(baseBlockY + hBlocks - 1), pitchAligned, bpbLog2));
         needBytes = (uint64_t)maxOff + fi.bpb + (layers > 1 ? faceBytes * (layers - 1) : 0);
-    }
+    } else needBytes += ((uint64_t)baseBlockY * pitchBlocks + baseBlockX) * fi.bpb;
     if (g_gpuTiming && fmtId == 23) {   // M60 diagnostico
         static int n23 = 0;
         if (n23 < 10) {
@@ -314,7 +340,7 @@ HostTexture* D3D12Backend::GetTexture(uint32_t idx, bool vertexStage) {
     }
     // M8: lectura de un resolve del mismo fotograma con coincidencia exacta -> copia GPU del RT (sin memoria guest)
     if (dimension == 1 && layers == 1 && depth == 1 && tiled && !((uint32_t)tf.sign_x == 3 && fi.dxgi != fi.srgb))
-        if (!shortcutVerifyActive)
+        if (!shortcutVerifyActive && !stateDump)
             if (HostTexture* rtx = LookupResolvedTex(baseAddr, width, height, fmtId, endian, pitchAligned, (uint32_t)tf.swizzle)) {
                 if (g_verifyShortcut) {   // M8: --verify-shortcut
                     shortcutVerifyActive = true;
@@ -350,7 +376,7 @@ HostTexture* D3D12Backend::GetTexture(uint32_t idx, bool vertexStage) {
         if (!g_texMemoOff) texMemo[memoKey] = {baseAddr, (uint32_t)std::min<uint64_t>((uint64_t)baseAddr + needBytes, 0xFFFFFFFFull), dataHash};
     }
     auto it = textures.find(key);
-    const bool debugDump = debugDumpTextureBase == baseAddr && debugDumpTextureFrame == rt::gpu::FrameCount() + 1 && debugDumpTextureDraw == drawSerial;
+    const bool debugDump = stateDump || (debugDumpTextureBase == baseAddr && debugDumpTextureFrame == rt::gpu::FrameCount() + 1 && debugDumpTextureDraw == drawSerial);
     if (it != textures.end() && it->second.dataHash == dataHash && it->second.res && !debugDump) { it->second.lastUse = ++texSerial; ++texHits; return &it->second; }
     // ---- conversion a datos lineales del host ----
     bool srgb = (uint32_t)tf.sign_x == 3 && fi.dxgi != fi.srgb;
@@ -363,7 +389,7 @@ HostTexture* D3D12Backend::GetTexture(uint32_t idx, bool vertexStage) {
     uint64_t m8t0 = perf::Now();
     std::vector<uint8_t>& lin = texScratch;   // M8: bufer reutilizado (antes un vector nuevo por subida)
     lin.resize((size_t)rowPitch * hBlocks * layers);
-    bool fastPath = (fi.expand == 0 || ((fi.expand == 4 || fi.expand == 5) && fi.bpb == 4)) && !g_texSlowPath;
+    bool fastPath = !baseBlockX && !baseBlockY && (fi.expand == 0 || ((fi.expand == 4 || fi.expand == 5) && fi.bpb == 4)) && !g_texSlowPath;
     if (fastPath) {   // M8: destilado por tramos + endian por fila (resultado identico al camino por bloque)
         for (uint32_t L = 0; L < layers; ++L) {
             uint8_t* dl = &lin[(size_t)L * layerPitchRows * rowPitch];
@@ -384,8 +410,8 @@ HostTexture* D3D12Backend::GetTexture(uint32_t idx, bool vertexStage) {
         for (uint32_t by = 0; by < hBlocks; ++by) {
             uint8_t* dst = &lin[((size_t)L * layerPitchRows + by) * rowPitch];
             for (uint32_t bx = 0; bx < wBlocks; ++bx) {
-                size_t off = tiled ? (size_t)xe::gpu::texture_address::Tiled2D((int32_t)bx, (int32_t)by, pitchAligned, bpbLog2)
-                                   : ((size_t)by * (pitchPx / bw) + bx) * fi.bpb;
+                size_t off = tiled ? (size_t)xe::gpu::texture_address::Tiled2D((int32_t)(baseBlockX + bx), (int32_t)(baseBlockY + by), pitchAligned, bpbLog2)
+                                   : ((size_t)(baseBlockY + by) * (pitchPx / bw) + baseBlockX + bx) * fi.bpb;
                 const uint8_t* s = lm + off;
                 uint8_t* d = dst + (size_t)bx * hostBpb;
                 // endian por palabras: 8in16 (1), 8in32 (2), 16in32 (3) sobre unidades de hasta 4 bytes
